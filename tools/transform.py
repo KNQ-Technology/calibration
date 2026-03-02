@@ -242,7 +242,9 @@ def pitch_to_video_pixel(
         - apply_distortion=False: 用于在去畸变后的视频上绘制
     """
     pitch_coords = np.array(pitch_coords, dtype=np.float32)
-    
+    # 处理空输入：直接返回空数组
+    if pitch_coords.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
     # 步骤1: 逆单应性变换 (球场坐标 → 理想像素坐标)
     H_inv = np.linalg.inv(homography_matrix)
     

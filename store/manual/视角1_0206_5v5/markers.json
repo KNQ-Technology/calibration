@@ -1,0 +1,44 @@
+{
+  "source": "视角1_0206_5v5_markers",
+  "type": "marker_annotation",
+  "groups": [
+    {
+      "group_id": 0,
+      "points": [
+        {
+          "id": 0,
+          "img_coord": [
+            261,
+            993
+          ]
+        },
+        {
+          "id": 1,
+          "img_coord": [
+            866,
+            870
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": 1,
+      "points": [
+        {
+          "id": 0,
+          "img_coord": [
+            1711,
+            743
+          ]
+        },
+        {
+          "id": 1,
+          "img_coord": [
+            2011,
+            683
+          ]
+        }
+      ]
+    }
+  ]
+}

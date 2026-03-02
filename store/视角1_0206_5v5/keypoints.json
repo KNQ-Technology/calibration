@@ -1,0 +1,97 @@
+{
+  "source": "cam_视角1_0206_5v5",
+  "config_type": "HalfQingYuanConfiguration",
+  "annotations": [
+    {
+      "id": 0,
+      "label": "01",
+      "img_coord": [
+        1659,
+        681
+      ],
+      "world_coord": [
+        0,
+        0
+      ],
+      "vertex_index": 0
+    },
+    {
+      "id": 1,
+      "label": "14",
+      "img_coord": [
+        2700,
+        708
+      ],
+      "world_coord": [
+        2900,
+        0
+      ],
+      "vertex_index": 13
+    },
+    {
+      "id": 2,
+      "label": "06",
+      "img_coord": [
+        42,
+        921
+      ],
+      "world_coord": [
+        0,
+        3600
+      ],
+      "vertex_index": 5
+    },
+    {
+      "id": 3,
+      "label": "17",
+      "img_coord": [
+        1584,
+        1782
+      ],
+      "world_coord": [
+        2900,
+        3600
+      ],
+      "vertex_index": 16
+    },
+    {
+      "id": 4,
+      "label": "16",
+      "img_coord": [
+        2514,
+        888
+      ],
+      "world_coord": [
+        2900,
+        2385
+      ],
+      "vertex_index": 15
+    },
+    {
+      "id": 5,
+      "label": "B7",
+      "img_coord": [
+        1074,
+        1539
+      ],
+      "world_coord": [
+        2706,
+        3600
+      ],
+      "vertex_index": 35
+    },
+    {
+      "id": 6,
+      "label": "B2",
+      "img_coord": [
+        99,
+        966
+      ],
+      "world_coord": [
+        773,
+        3600
+      ],
+      "vertex_index": 25
+    }
+  ]
+}

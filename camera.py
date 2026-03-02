@@ -181,7 +181,8 @@ class CameraFOVCalculator:
             (N, 2) 球场坐标点
         """
         img_points = np.array(img_points, dtype=np.float32).reshape(-1, 1, 2)
-        
+        if img_points.size == 0:
+            return np.empty((0, 2), dtype=np.float32)
         # 去畸变
         if self.distortion_params is not None:
             from de_distortion import undistort_points
@@ -323,9 +324,9 @@ class CameraFOVCalculator:
         在原有基础上增加了对异常点的检查和过滤，确保拟合的稳定性。
         """
         boundary_points = []
-        repeat = 500
+        repeat = 1000
         while repeat > 0:
-            boundary_points = self._calculate_boundary_line(side, output_samples, dev = (500 - repeat))
+            boundary_points = self._calculate_boundary_line(side, output_samples, dev = (1000 - repeat))
             if len(boundary_points) > 10:
                 break
             repeat -= 1
@@ -848,7 +849,7 @@ class Camera:
         
         # 3. 计算相机视野信息（支持畸变校正）
         # 定义球场合理范围（用于过滤异常点）
-        margin_ratio = 0.1
+        margin_ratio = 0.5
         pitch_bounds = (
             -self.config.length * margin_ratio,  # x_min
             self.config.length * (1 + margin_ratio),  # x_max
@@ -1500,7 +1501,7 @@ class Camera:
         
         # 2.5. 过滤不合理的点（超出场地范围太多的点）
         # 定义合理范围：场地范围 ± 余量（50%）
-        margin_ratio = 0.1
+        margin_ratio = 0.5
         x_min = -self.config.length * margin_ratio
         x_max = self.config.length * (1 + margin_ratio)
         y_min = -self.config.width * margin_ratio

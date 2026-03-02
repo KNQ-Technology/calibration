@@ -1,0 +1,98 @@
+{
+  "source": "manual_horizontal",
+  "type": "marker_annotation",
+  "groups": [
+    {
+      "group_id": 0,
+      "points": [
+        {
+          "id": 0,
+          "img_coord": [
+            45,
+            924
+          ]
+        },
+        {
+          "id": 1,
+          "img_coord": [
+            261,
+            1080
+          ]
+        },
+        {
+          "id": 2,
+          "img_coord": [
+            486,
+            1218
+          ]
+        },
+        {
+          "id": 3,
+          "img_coord": [
+            783,
+            1395
+          ]
+        },
+        {
+          "id": 4,
+          "img_coord": [
+            1122,
+            1575
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": 1,
+      "points": [
+        {
+          "id": 0,
+          "img_coord": [
+            450,
+            849
+          ]
+        },
+        {
+          "id": 1,
+          "img_coord": [
+            546,
+            861
+          ]
+        },
+        {
+          "id": 2,
+          "img_coord": [
+            666,
+            879
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": 2,
+      "points": [
+        {
+          "id": 0,
+          "img_coord": [
+            54,
+            1167
+          ]
+        },
+        {
+          "id": 1,
+          "img_coord": [
+            264,
+            1461
+          ]
+        },
+        {
+          "id": 2,
+          "img_coord": [
+            504,
+            1752
+          ]
+        }
+      ]
+    }
+  ]
+}
