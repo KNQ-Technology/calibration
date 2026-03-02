@@ -1,0 +1,72 @@
+{
+  "source": "manual_vertical",
+  "type": "marker_annotation",
+  "groups": [
+    {
+      "group_id": 0,
+      "points": [
+        {
+          "id": 0,
+          "img_coord": [
+            795,
+            1134
+          ]
+        },
+        {
+          "id": 1,
+          "img_coord": [
+            1134,
+            1464
+          ]
+        },
+        {
+          "id": 2,
+          "img_coord": [
+            1626,
+            1878
+          ]
+        },
+        {
+          "id": 3,
+          "img_coord": [
+            1923,
+            2115
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": 1,
+      "points": [
+        {
+          "id": 0,
+          "img_coord": [
+            3090,
+            936
+          ]
+        },
+        {
+          "id": 1,
+          "img_coord": [
+            3315,
+            957
+          ]
+        },
+        {
+          "id": 2,
+          "img_coord": [
+            3657,
+            990
+          ]
+        },
+        {
+          "id": 3,
+          "img_coord": [
+            3810,
+            1008
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,131 @@
+{
+  "source": "manual_horizontal",
+  "type": "marker_annotation",
+  "groups": [
+    {
+      "group_id": 0,
+      "points": [
+        {
+          "id": 0,
+          "img_coord": [
+            3312,
+            963
+          ]
+        },
+        {
+          "id": 1,
+          "img_coord": [
+            3300,
+            1074
+          ]
+        },
+        {
+          "id": 2,
+          "img_coord": [
+            3276,
+            1251
+          ]
+        },
+        {
+          "id": 3,
+          "img_coord": [
+            3243,
+            1446
+          ]
+        },
+        {
+          "id": 4,
+          "img_coord": [
+            3183,
+            1746
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": 1,
+      "points": [
+        {
+          "id": 0,
+          "img_coord": [
+            3555,
+            984
+          ]
+        },
+        {
+          "id": 1,
+          "img_coord": [
+            3627,
+            1035
+          ]
+        },
+        {
+          "id": 2,
+          "img_coord": [
+            3783,
+            1161
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": 2,
+      "points": [
+        {
+          "id": 0,
+          "img_coord": [
+            3084,
+            939
+          ]
+        },
+        {
+          "id": 1,
+          "img_coord": [
+            2982,
+            987
+          ]
+        },
+        {
+          "id": 2,
+          "img_coord": [
+            2709,
+            1128
+          ]
+        },
+        {
+          "id": 3,
+          "img_coord": [
+            2382,
+            1287
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": 3,
+      "points": [
+        {
+          "id": 0,
+          "img_coord": [
+            999,
+            939
+          ]
+        },
+        {
+          "id": 1,
+          "img_coord": [
+            1272,
+            912
+          ]
+        },
+        {
+          "id": 2,
+          "img_coord": [
+            1590,
+            885
+          ]
+        }
+      ]
+    }
+  ]
+}
