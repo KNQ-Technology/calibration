@@ -1,8 +1,8 @@
-dir_path: "C:/Users/13681/Downloads"
-video_name: "5v5比赛 第一段.mp4"
-CAMERA_NAME: "视角1_0206_5v5"
+dir_path: "."
+video_name: "机位1 30s.mp4"
+CAMERA_NAME: "机位1_30s"
 MCS_NAME: null
-config: "HalfQingYuanConfiguration"
+config: "QingYuanConfiguration"
 GROUP_CONFIGS: [
     {'group': 0, 'is_closed': false},  # 组1：线性
     {'group': 1, 'is_closed': false},   # 组2：环形
@@ -16,4 +16,3 @@ PAIR_CONFIGS: [
 jac: "3-point" # 差分格式，可选 "2-point" 或 "3-point"
 reprojection_eps: 5.0 # 重投影误差判定
 enable_orientation: true # 是否启用保定向判定
-
