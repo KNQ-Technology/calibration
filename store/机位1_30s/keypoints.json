@@ -1,74 +1,22 @@
 {
-  "source": "cam_机位1_30s",
+  "source": "机位1 30s.mp4",
   "config_type": "QingYuanConfiguration",
   "annotations": [
     {
       "id": 0,
-      "label": "01",
+      "label": "05",
       "img_coord": [
-        2130,
-        861
+        996,
+        939
       ],
       "world_coord": [
         0,
-        0
+        3045
       ],
-      "vertex_index": 0
+      "vertex_index": 4
     },
     {
       "id": 1,
-      "label": "15",
-      "img_coord": [
-        3312,
-        960
-      ],
-      "world_coord": [
-        2900,
-        0
-      ],
-      "vertex_index": 13
-    },
-    {
-      "id": 2,
-      "label": "T6",
-      "img_coord": [
-        2979,
-        927
-      ],
-      "world_coord": [
-        2320,
-        0
-      ],
-      "vertex_index": 42
-    },
-    {
-      "id": 3,
-      "label": "T9",
-      "img_coord": [
-        3672,
-        996
-      ],
-      "world_coord": [
-        3480,
-        0
-      ],
-      "vertex_index": 48
-    },
-    {
-      "id": 4,
-      "label": "17",
-      "img_coord": [
-        3288,
-        1200
-      ],
-      "world_coord": [
-        2900,
-        2385
-      ],
-      "vertex_index": 15
-    },
-    {
-      "id": 5,
       "label": "06",
       "img_coord": [
         630,
@@ -81,33 +29,33 @@
       "vertex_index": 5
     },
     {
-      "id": 6,
-      "label": "B7",
+      "id": 2,
+      "label": "15",
       "img_coord": [
-        1920,
-        2097
+        3312,
+        960
       ],
       "world_coord": [
-        2706,
-        3600
+        2900,
+        0
       ],
-      "vertex_index": 45
+      "vertex_index": 13
     },
     {
-      "id": 7,
-      "label": "B6",
+      "id": 3,
+      "label": "17",
       "img_coord": [
-        1185,
-        1500
+        3288,
+        1200
       ],
       "world_coord": [
-        2320,
-        3600
+        2900,
+        2385
       ],
-      "vertex_index": 43
+      "vertex_index": 15
     },
     {
-      "id": 8,
+      "id": 4,
       "label": "B2",
       "img_coord": [
         681,
@@ -120,17 +68,56 @@
       "vertex_index": 35
     },
     {
-      "id": 9,
-      "label": "05",
+      "id": 5,
+      "label": "T6",
       "img_coord": [
-        996,
-        939
+        2979,
+        927
       ],
       "world_coord": [
-        0,
-        3045
+        2320,
+        0
       ],
-      "vertex_index": 4
+      "vertex_index": 42
+    },
+    {
+      "id": 6,
+      "label": "B6",
+      "img_coord": [
+        1185,
+        1500
+      ],
+      "world_coord": [
+        2320,
+        3600
+      ],
+      "vertex_index": 43
+    },
+    {
+      "id": 7,
+      "label": "B7",
+      "img_coord": [
+        1920,
+        2097
+      ],
+      "world_coord": [
+        2706,
+        3600
+      ],
+      "vertex_index": 45
+    },
+    {
+      "id": 8,
+      "label": "T9",
+      "img_coord": [
+        3672,
+        996
+      ],
+      "world_coord": [
+        3480,
+        0
+      ],
+      "vertex_index": 48
     }
   ]
 }

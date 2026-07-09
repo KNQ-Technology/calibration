@@ -438,13 +438,17 @@ def load_configure():
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
     video_path = os.path.join(cfg['dir_path'], cfg['video_name'])
-    return video_path, cfg['CAMERA_NAME'], cfg['config'], cfg['GROUP_CONFIGS'], cfg['PAIR_CONFIGS']
+    # 输出根目录（可选配置，默认为项目下的 store/）
+    store_root = cfg.get('store_dir') or 'store'
+    if not os.path.isabs(store_root):
+        store_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), store_root)
+    return video_path, cfg['CAMERA_NAME'], cfg['config'], cfg['GROUP_CONFIGS'], cfg['PAIR_CONFIGS'], store_root
 
 def main():
     """主函数示例"""
     
     # 配置测量参数
-    VIDEO_PATH, CAMERA_NAME, config, GROUP_CONFIGS, PAIR_CONFIGS = load_configure()
+    VIDEO_PATH, CAMERA_NAME, config, GROUP_CONFIGS, PAIR_CONFIGS, STORE_ROOT = load_configure()
     config = getattr(soccer, config)()  # 从 soccer 模块加载配置对象
     # ========== 执行流程 ==========
     
@@ -466,7 +470,7 @@ def main():
     '''
 
     # 1. 初始化相机（使用本地视频路径和配置）
-    store_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "store", CAMERA_NAME)
+    store_path = os.path.join(STORE_ROOT, CAMERA_NAME)
     camera = Camera(
         video_path=VIDEO_PATH,
         pitch_config=config,
@@ -476,7 +480,7 @@ def main():
 
     # 2. 创建测量对象
     print("\n[2/5] 创建测量对象...")
-    measurement = MarkerMeasurement(camera)
+    measurement = MarkerMeasurement(camera, output_dir=os.path.join(STORE_ROOT, "manual", CAMERA_NAME))
     
     # 3. 标注标志物
     print("\n[3/5] 标注标志物...")
