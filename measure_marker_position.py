@@ -248,6 +248,19 @@ class MarkerMeasurement:
         for i, group in enumerate(self.marker_groups_pitch):
             report.append(f"  组 {i+1}: {len(group)} 个标志物")
         
+        # 如果未提供 group_configs，则自动为所有组生成默认配置（线性模式）
+        if group_configs is None:
+            group_configs = [{'group': i, 'is_closed': False} for i in range(len(self.marker_groups_pitch))]
+        else:
+            # 补齐未显式配置的组（默认线性）
+            configured_groups = {c['group'] for c in group_configs}
+            for i in range(len(self.marker_groups_pitch)):
+                if i not in configured_groups:
+                    group_configs = list(group_configs) + [{'group': i, 'is_closed': False}]
+        
+        # 按组索引排序，确保输出顺序一致
+        group_configs = sorted(group_configs, key=lambda c: c['group'])
+        
         # 组内距离测量
         if group_configs:
             report.append("\n【组内距离测量】")
@@ -333,7 +346,18 @@ class MarkerMeasurement:
                 cv2.circle(pitch_img, pt_pix, 5, color, -1)
                 cv2.circle(pitch_img, pt_pix, 7, (255, 255, 255), 2)
         
-        # 绘制组内距离
+        # 绘制组内距离（如果未提供group_configs，自动为所有组生成默认线性配置）
+        if group_configs is None:
+            group_configs = [{'group': i, 'is_closed': False} for i in range(len(self.marker_groups_pitch))]
+        else:
+            configured_groups = {c['group'] for c in group_configs}
+            auto_defaults = []
+            for i in range(len(self.marker_groups_pitch)):
+                if i not in configured_groups:
+                    auto_defaults.append({'group': i, 'is_closed': False})
+            group_configs = list(group_configs) + auto_defaults
+        group_configs = sorted(group_configs, key=lambda c: c['group'])
+        
         if group_configs:
             for config in group_configs:
                 group_idx = config['group']
@@ -359,6 +383,9 @@ class MarkerMeasurement:
                 g1_idx = config['group1']
                 g2_idx = config['group2']
                 measure_type = config.get('type', 'center')
+                if g1_idx >= len(self.marker_groups_pitch) or g2_idx >= len(self.marker_groups_pitch):
+                    print(f"⚠️  跳过组间测量 {g1_idx}↔{g2_idx}：实际只有 {len(self.marker_groups_pitch)} 组标志物")
+                    continue
                 
                 if measure_type in ['center', 'both']:
                     pitch_img = draw_distance_between_groups(

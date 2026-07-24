@@ -1,18 +1,20 @@
-dir_path: D:\1-knq\calibration
-video_name: 机位1 30s.mp4
-CAMERA_NAME: 机位1_30s
+dir_path: /Users/asd/Desktop
+video_name: 录屏2026-07-24 10.23.11.mov
+CAMERA_NAME: 0723-清源-抢圈
 store_dir: store
 MCS_NAME: null
 config: QingYuanConfiguration
 GROUP_CONFIGS:
 - group: 0
-  is_closed: false
+  is_closed: true
 - group: 1
+  is_closed: true
+- group: 2
   is_closed: false
 PAIR_CONFIGS:
 - group1: 0
   group2: 1
-  type: both
+  type: nearest
 jac: 3-point
 reprojection_eps: 5.0
 enable_orientation: true

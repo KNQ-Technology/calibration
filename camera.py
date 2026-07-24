@@ -3266,7 +3266,11 @@ class TrainArea:
         print("  - 白色点/数字: 球场固定关键点 (序号 1, 2, 3...)")
         print("  - 红色点/V数字: 从视频画面标定的点 (序号 V1, V2...)")
 
-        sv.plot_image(pitch_img)  # 使用 supervision 显示，或 cv2.imshow
+        try:
+            sv.plot_image(pitch_img)
+        except NameError:
+            cv2.imshow("训练区域选择 - 球场俯视图", pitch_img)
+            cv2.waitKey(1)
 
         # 4. 接收用户输入
         print("\n请输入构成训练区域的点序号，按顺序输入，用逗号或空格分隔。")

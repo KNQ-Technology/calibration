@@ -315,6 +315,15 @@ class AnnotationClient(tk.Tk):
         self.store_root = self.config_data.get("store_dir") or "store"
         self.store_root_var = tk.StringVar(value=self.store_root)
 
+        # 测量配置变量
+        self.num_marker_groups = tk.IntVar(value=2)
+        self.group_config_widgets: List[Dict[str, Any]] = []
+        self.pair_enabled_vars: Dict[Tuple[int, int], tk.BooleanVar] = {}
+        self.pair_type_vars: Dict[Tuple[int, int], tk.StringVar] = {}
+        self._group_closed_vars: Dict[int, tk.BooleanVar] = {}
+        self._build_measurement_config_defaults()
+        self.num_marker_groups.trace_add("write", lambda *_: self._on_num_groups_changed())
+
         self._load_existing_annotations()
         self._build_ui()
         self._refresh_vertex_options()
@@ -785,9 +794,147 @@ class AnnotationClient(tk.Tk):
         )
         self.pitch_config_combo.grid(row=10, column=0, sticky="ew", pady=(0, 8))
 
+        # ---- 标志物测量配置 ----
+        measure_box = ttk.LabelFrame(panel, text="标志物测量配置", padding=8)
+        measure_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        measure_box.columnconfigure(0, weight=1)
+
+        # 组数选择
+        groups_header = ttk.Frame(measure_box)
+        groups_header.grid(row=0, column=0, sticky="ew")
+        groups_header.columnconfigure(2, weight=1)
+        ttk.Label(groups_header, text="器材组数").grid(row=0, column=0, sticky="w")
+        self.num_groups_spin = ttk.Spinbox(
+            groups_header, from_=1, to=9, width=5,
+            textvariable=self.num_marker_groups,
+            command=self._on_num_groups_changed,
+        )
+        self.num_groups_spin.grid(row=0, column=1, padx=(8, 0), sticky="w")
+
+        # 每组配置区域（动态生成）
+        self.group_configs_frame = ttk.Frame(measure_box)
+        self.group_configs_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.group_configs_frame.columnconfigure(0, weight=1)
+
+        # 组间距离配置区域
+        pair_header = ttk.Frame(measure_box)
+        pair_header.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(pair_header, text="组间距离测量", font=(UI_FONT, 10, "bold")).grid(
+            row=0, column=0, sticky="w")
+        self.pair_configs_frame = ttk.Frame(measure_box)
+        self.pair_configs_frame.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        self.pair_configs_frame.columnconfigure(0, weight=1)
+
         ttk.Button(box, text="应用并保存配置 (config.yaml)",
                    command=self.apply_setup).grid(row=11, column=0, sticky="ew")
         self._refresh_store_dir_hint()
+        self._rebuild_group_configs()
+        self._rebuild_pair_configs()
+
+    # ------------------------------------------------------------------
+    # 测量配置 UI 辅助方法
+    # ------------------------------------------------------------------
+
+    def _build_measurement_config_defaults(self) -> None:
+        """从 config.yaml 加载 GROUP_CONFIGS / PAIR_CONFIGS 初始化变量"""
+        group_cfgs = self.config_data.get("GROUP_CONFIGS") or [
+            {"group": 0, "is_closed": False}, {"group": 1, "is_closed": False}
+        ]
+        pair_cfgs = self.config_data.get("PAIR_CONFIGS") or []
+
+        max_g = 0
+        self._group_closed_vars: Dict[int, tk.BooleanVar] = {}
+        for gc in group_cfgs:
+            g = gc.get("group", 0)
+            max_g = max(max_g, g)
+            self._group_closed_vars[g] = tk.BooleanVar(value=gc.get("is_closed", False))
+        self.num_marker_groups.set(max(max_g + 1, 2))
+
+        for pc in pair_cfgs:
+            g1 = pc.get("group1", 0)
+            g2 = pc.get("group2", 1)
+            key = (g1, g2)
+            self.pair_enabled_vars[key] = tk.BooleanVar(value=True)
+            self.pair_type_vars[key] = tk.StringVar(value=pc.get("type", "both"))
+
+    def _on_num_groups_changed(self) -> None:
+        """组数改变时，动态重建每组配置和组间配置"""
+        self._rebuild_group_configs()
+        self._rebuild_pair_configs()
+
+    def _rebuild_group_configs(self) -> None:
+        """重建每组的配置行（环形/线形复选框）"""
+        if not hasattr(self, "group_configs_frame"):
+            return
+        for w in self.group_configs_frame.winfo_children():
+            w.destroy()
+        self.group_config_widgets.clear()
+
+        n = max(1, int(self.num_marker_groups.get()))
+        for i in range(n):
+            if i not in self._group_closed_vars:
+                self._group_closed_vars[i] = tk.BooleanVar(value=False)
+            row = ttk.Frame(self.group_configs_frame)
+            row.grid(row=i, column=0, sticky="ew", pady=1)
+            ttk.Label(row, text=f"第 {i+1} 组").grid(row=0, column=0, sticky="w")
+            closed_var = self._group_closed_vars[i]
+            cb = ttk.Checkbutton(row, text="环形（闭合）", variable=closed_var)
+            cb.grid(row=0, column=1, padx=(12, 0), sticky="w")
+            self.group_config_widgets.append({"frame": row, "closed_var": closed_var})
+
+    def _rebuild_pair_configs(self) -> None:
+        """重建组间距离配置行"""
+        if not hasattr(self, "pair_configs_frame"):
+            return
+        for w in self.pair_configs_frame.winfo_children():
+            w.destroy()
+
+        n = max(1, int(self.num_marker_groups.get()))
+        row_idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                key = (i, j)
+                if key not in self.pair_enabled_vars:
+                    self.pair_enabled_vars[key] = tk.BooleanVar(value=False)
+                if key not in self.pair_type_vars:
+                    self.pair_type_vars[key] = tk.StringVar(value="center")
+                enabled_var = self.pair_enabled_vars[key]
+                type_var = self.pair_type_vars[key]
+
+                row = ttk.Frame(self.pair_configs_frame)
+                row.grid(row=row_idx, column=0, sticky="ew", pady=1)
+                ttk.Checkbutton(row, text=f"组{i+1} ↔ 组{j+1}",
+                                variable=enabled_var).grid(row=0, column=0, sticky="w")
+                ttk.Label(row, text="  方式:").grid(row=0, column=1, sticky="w")
+                cb = ttk.Combobox(row, textvariable=type_var, width=10, state="readonly",
+                                  values=["center", "nearest", "both"])
+                cb.grid(row=0, column=2, padx=(4, 0), sticky="w")
+                row_idx += 1
+
+    def _collect_group_configs(self) -> List[Dict[str, Any]]:
+        """从 GUI 收集 GROUP_CONFIGS"""
+        configs = []
+        n = max(1, int(self.num_marker_groups.get()))
+        for i in range(n):
+            is_closed = False
+            if i in self._group_closed_vars:
+                is_closed = bool(self._group_closed_vars[i].get())
+            configs.append({"group": i, "is_closed": is_closed})
+        return configs
+
+    def _collect_pair_configs(self) -> List[Dict[str, Any]]:
+        """从 GUI 收集 PAIR_CONFIGS"""
+        configs = []
+        n = max(1, int(self.num_marker_groups.get()))
+        for i in range(n):
+            for j in range(i + 1, n):
+                key = (i, j)
+                enabled = self.pair_enabled_vars.get(key)
+                if enabled and enabled.get():
+                    ptype = self.pair_type_vars.get(key)
+                    ptype_val = ptype.get() if ptype else "center"
+                    configs.append({"group1": i, "group2": j, "type": ptype_val})
+        return configs
 
     def browse_store_root(self) -> None:
         path = filedialog.askdirectory(initialdir=str(self._resolve_store_root().parent
@@ -986,8 +1133,8 @@ class AnnotationClient(tk.Tk):
         data["config"] = self.selected_pitch_config.get()
         data["store_dir"] = self.store_root
         data.setdefault("MCS_NAME", None)
-        data.setdefault("GROUP_CONFIGS", [{"group": 0, "is_closed": False}, {"group": 1, "is_closed": False}])
-        data.setdefault("PAIR_CONFIGS", [{"group1": 0, "group2": 1, "type": "both"}])
+        data["GROUP_CONFIGS"] = self._collect_group_configs()
+        data["PAIR_CONFIGS"] = self._collect_pair_configs()
         data.setdefault("jac", "3-point")
         data.setdefault("reprojection_eps", 5.0)
         data.setdefault("enable_orientation", True)
