@@ -530,6 +530,31 @@ class GaoWuConfiguration(SoccerPitchConfiguration):
     centre_circle_radius: int = 417  # [cm] 中圈半径 4.17m
     penalty_spot_distance: int = 630  # [cm] 点球点到底线 6.3m
 
+    @property
+    def vertices(self) -> List[Tuple[int, int]]:
+        # 复用全场基础关键点，并补充上下边线的草皮分界点。
+        base_vertices = super().vertices
+        segments = 15
+        step = self.length / segments
+        extra_vertices = []
+        for i in range(1, segments):
+            x = i * step
+            extra_vertices.append((x, 0))
+            extra_vertices.append((x, self.width))
+        return base_vertices + extra_vertices
+
+    labels: List[str] = field(default_factory=lambda: (
+        SoccerPitchConfiguration().labels + [
+            label
+            for i in range(1, 15)
+            for label in (f"T{i}", f"B{i}")
+        ]
+    ))
+
+    colors: List[str] = field(default_factory=lambda: (
+        SoccerPitchConfiguration().colors + ["#00FF00"] * 28
+    ))
+
 
 @dataclass
 class HalfGaoWuConfiguration(HalfPitchConfiguration):
@@ -543,6 +568,31 @@ class HalfGaoWuConfiguration(HalfPitchConfiguration):
     goal_box_length: int = 278  # [cm] 小禁区向场内深度 2.78m
     centre_circle_radius: int = 417  # [cm] 中圈半径 4.17m
     penalty_spot_distance: int = 630  # [cm] 点球点到底线 6.3m
+
+    @property
+    def vertices(self) -> List[Tuple[int, int]]:
+        # 与清源小学半场一致，按全场 15 等分补充半场内的 7 组上下边线点。
+        base_vertices = super().vertices
+        full_length = self.length * 2
+        step = full_length / 15
+        extra_vertices = []
+        for i in range(1, 8):
+            x = i * step
+            extra_vertices.append((x, 0))
+            extra_vertices.append((x, self.width))
+        return base_vertices + extra_vertices
+
+    labels: List[str] = field(default_factory=lambda: (
+        HalfPitchConfiguration().labels + [
+            label
+            for i in range(1, 8)
+            for label in (f"T{i}", f"B{i}")
+        ]
+    ))
+
+    colors: List[str] = field(default_factory=lambda: (
+        HalfPitchConfiguration().colors + ["#00FF00"] * 14
+    ))
 
 @dataclass
 class HalfWuChuanConfiguration:
