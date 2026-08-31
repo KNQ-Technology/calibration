@@ -516,6 +516,34 @@ class WuChuanConfiguration:
         
         return base_colors + required_colors + extra_colors
 
+
+@dataclass
+class GaoWuConfiguration(SoccerPitchConfiguration):
+    """高屋小学全场配置（48m × 32m）。"""
+
+    width: int = 3200  # [cm] 32m
+    length: int = 4800  # [cm] 48m
+    penalty_box_width: int = 1770  # [cm] 大禁区横向宽度（平行于底线）17.7m
+    penalty_box_length: int = 684  # [cm] 大禁区向场内深度 6.84m
+    goal_box_width: int = 948  # [cm] 小禁区横向宽度 9.48m
+    goal_box_length: int = 278  # [cm] 小禁区向场内深度 2.78m
+    centre_circle_radius: int = 417  # [cm] 中圈半径 4.17m
+    penalty_spot_distance: int = 630  # [cm] 点球点到底线 6.3m
+
+
+@dataclass
+class HalfGaoWuConfiguration(HalfPitchConfiguration):
+    """高屋小学半场配置（24m × 32m）。"""
+
+    width: int = 3200  # [cm] 32m
+    length: int = 2400  # [cm] 24m
+    penalty_box_width: int = 1770  # [cm] 大禁区横向宽度（平行于底线）17.7m
+    penalty_box_length: int = 684  # [cm] 大禁区向场内深度 6.84m
+    goal_box_width: int = 948  # [cm] 小禁区横向宽度 9.48m
+    goal_box_length: int = 278  # [cm] 小禁区向场内深度 2.78m
+    centre_circle_radius: int = 417  # [cm] 中圈半径 4.17m
+    penalty_spot_distance: int = 630  # [cm] 点球点到底线 6.3m
+
 @dataclass
 class HalfWuChuanConfiguration:
     """吴川半场配置 (33m × 44m)"""
