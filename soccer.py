@@ -519,10 +519,10 @@ class WuChuanConfiguration:
 
 @dataclass
 class GaoWuConfiguration(SoccerPitchConfiguration):
-    """高屋小学全场配置（48m × 32m）。"""
+    """高屋小学全场配置（48.92m × 32.24m）。"""
 
-    width: int = 3200  # [cm] 32m
-    length: int = 4800  # [cm] 48m
+    width: int = 3224  # [cm] 32.24m
+    length: int = 4892  # [cm] 48.92m
     penalty_box_width: int = 1770  # [cm] 大禁区横向宽度（平行于底线）17.7m
     penalty_box_length: int = 684  # [cm] 大禁区向场内深度 6.84m
     goal_box_width: int = 948  # [cm] 小禁区横向宽度 9.48m
@@ -533,10 +533,10 @@ class GaoWuConfiguration(SoccerPitchConfiguration):
 
 @dataclass
 class HalfGaoWuConfiguration(HalfPitchConfiguration):
-    """高屋小学半场配置（24m × 32m）。"""
+    """高屋小学半场配置（24.46m × 32.24m）。"""
 
-    width: int = 3200  # [cm] 32m
-    length: int = 2400  # [cm] 24m
+    width: int = 3224  # [cm] 32.24m
+    length: int = 2446  # [cm] 24.46m
     penalty_box_width: int = 1770  # [cm] 大禁区横向宽度（平行于底线）17.7m
     penalty_box_length: int = 684  # [cm] 大禁区向场内深度 6.84m
     goal_box_width: int = 948  # [cm] 小禁区横向宽度 9.48m
