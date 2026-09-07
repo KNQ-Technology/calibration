@@ -6,7 +6,7 @@ import numpy as np
 from soccer import *
 
 def draw_pitch(
-    config: Union[SoccerPitchConfiguration, HalfPitchConfiguration, QingYuanConfiguration, HalfQingYuanConfiguration, WuChuanConfiguration, HalfWuChuanConfiguration],
+    config: Union[SoccerPitchConfiguration, HalfPitchConfiguration, QingYuanConfiguration, HalfQingYuanConfiguration, WuChuanConfiguration, HalfWuChuanConfiguration, WuChuanYiZhongConfiguration, HalfWuChuanYiZhongConfiguration],
     background_color: sv.Color = sv.Color(34, 139, 34),
     line_color: sv.Color = sv.Color.WHITE,
     padding: int = 50,
@@ -24,7 +24,7 @@ def draw_pitch(
     scaled_penalty_spot_distance = int(config.penalty_spot_distance * scale)
 
     # 判断是否为半场配置
-    is_half_pitch = isinstance(config, (HalfPitchConfiguration, HalfQingYuanConfiguration, HalfWuChuanConfiguration))
+    is_half_pitch = isinstance(config, (HalfPitchConfiguration, HalfQingYuanConfiguration, HalfWuChuanConfiguration, HalfWuChuanYiZhongConfiguration))
 
     # 2. 创建画布
     pitch_image = np.ones(
@@ -110,7 +110,7 @@ def draw_pitch(
 
 
 def draw_points_on_pitch(
-    config: Union[SoccerPitchConfiguration, HalfPitchConfiguration, QingYuanConfiguration, HalfQingYuanConfiguration, WuChuanConfiguration, HalfWuChuanConfiguration],
+    config: Union[SoccerPitchConfiguration, HalfPitchConfiguration, QingYuanConfiguration, HalfQingYuanConfiguration, WuChuanConfiguration, HalfWuChuanConfiguration, WuChuanYiZhongConfiguration, HalfWuChuanYiZhongConfiguration],
     xy: np.ndarray,
     face_color: sv.Color = sv.Color.RED,
     edge_color: sv.Color = sv.Color.BLACK,
@@ -167,7 +167,7 @@ def draw_points_on_pitch(
 
 
 def draw_paths_on_pitch(
-    config: Union[SoccerPitchConfiguration, HalfPitchConfiguration, QingYuanConfiguration, HalfQingYuanConfiguration, WuChuanConfiguration, HalfWuChuanConfiguration],
+    config: Union[SoccerPitchConfiguration, HalfPitchConfiguration, QingYuanConfiguration, HalfQingYuanConfiguration, WuChuanConfiguration, HalfWuChuanConfiguration, WuChuanYiZhongConfiguration, HalfWuChuanYiZhongConfiguration],
     paths: List[np.ndarray],
     color: sv.Color = sv.Color.WHITE,
     thickness: int = 2,
@@ -198,7 +198,7 @@ def draw_paths_on_pitch(
 
 
 def draw_pitch_voronoi_diagram(
-    config: Union[SoccerPitchConfiguration, HalfPitchConfiguration, QingYuanConfiguration, HalfQingYuanConfiguration, WuChuanConfiguration, HalfWuChuanConfiguration],
+    config: Union[SoccerPitchConfiguration, HalfPitchConfiguration, QingYuanConfiguration, HalfQingYuanConfiguration, WuChuanConfiguration, HalfWuChuanConfiguration, WuChuanYiZhongConfiguration, HalfWuChuanYiZhongConfiguration],
     team_1_xy: np.ndarray,
     team_2_xy: np.ndarray,
     team_1_color: sv.Color = sv.Color.RED,
@@ -250,7 +250,7 @@ def draw_pitch_voronoi_diagram(
 
 
 def draw_pitch_with_keypoints(
-    config: Union[SoccerPitchConfiguration, HalfPitchConfiguration, QingYuanConfiguration, HalfQingYuanConfiguration, WuChuanConfiguration, HalfWuChuanConfiguration],
+    config: Union[SoccerPitchConfiguration, HalfPitchConfiguration, QingYuanConfiguration, HalfQingYuanConfiguration, WuChuanConfiguration, HalfWuChuanConfiguration, WuChuanYiZhongConfiguration, HalfWuChuanYiZhongConfiguration],
     background_color: sv.Color = sv.Color(34, 139, 34),
     line_color: sv.Color = sv.Color.WHITE,
     padding: int = 50,

@@ -357,6 +357,8 @@ class AnnotationClient(tk.Tk):
             "HalfQingYuanConfiguration",
             "WuChuanConfiguration",
             "HalfWuChuanConfiguration",
+            "WuChuanYiZhongConfiguration",
+            "HalfWuChuanYiZhongConfiguration",
             "SoccerPitchConfiguration",
             "HalfPitchConfiguration",
         ]

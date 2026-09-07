@@ -518,6 +518,24 @@ class WuChuanConfiguration:
 
 
 @dataclass
+class WuChuanYiZhongConfiguration(WuChuanConfiguration):
+    """吴川一中全场配置（68m × 46.5m）。
+
+    吴川一中的场地标线尺寸与通用吴川场地不同，因此单独保留一个配置类，
+    避免修改已有吴川项目的标定坐标。
+    """
+
+    width: int = 4650  # [cm] 场地宽 46.5m
+    length: int = 6800  # [cm] 场地长 68m
+    penalty_box_width: int = 2550  # [cm] 大禁区横向宽度 25.5m
+    penalty_box_length: int = 995  # [cm] 大禁区向场内深度 9.95m
+    goal_box_width: int = 1350  # [cm] 小禁区横向宽度 13.5m
+    goal_box_length: int = 400  # [cm] 小禁区向场内深度 4m
+    centre_circle_radius: int = 600  # [cm] 中圈半径 6m
+    penalty_spot_distance: int = 900  # [cm] 点球点到底线 9m
+
+
+@dataclass
 class GaoWuConfiguration(SoccerPitchConfiguration):
     """高屋小学全场配置（48.92m × 32.24m）。"""
 
@@ -644,9 +662,9 @@ class HalfWuChuanConfiguration:
         ]
         
         # 草皮分界点 (半场10.5块)
-        # 全场 step = 6600 / 21 = 314.29cm
+        # 全场等分步长由全场长度推导，便于复用到不同长度的吴川半场配置。
         # 半场范围内有 10 个完整分点
-        full_length = 6600
+        full_length = self.length * 2
         step = full_length / 21
         
         extra_vertices = []
@@ -705,3 +723,17 @@ class HalfWuChuanConfiguration:
         extra_colors = ["#00FF00"] * 20
         
         return base_colors + required_colors + extra_colors
+
+
+@dataclass
+class HalfWuChuanYiZhongConfiguration(HalfWuChuanConfiguration):
+    """吴川一中半场配置（34m × 46.5m）。"""
+
+    width: int = 4650  # [cm] 场地宽 46.5m
+    length: int = 3400  # [cm] 半场长 34m
+    penalty_box_width: int = 2550  # [cm] 大禁区横向宽度 25.5m
+    penalty_box_length: int = 995  # [cm] 大禁区向场内深度 9.95m
+    goal_box_width: int = 1350  # [cm] 小禁区横向宽度 13.5m
+    goal_box_length: int = 400  # [cm] 小禁区向场内深度 4m
+    centre_circle_radius: int = 600  # [cm] 中圈半径 6m
+    penalty_spot_distance: int = 900  # [cm] 点球点到底线 9m
