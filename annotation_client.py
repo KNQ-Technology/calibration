@@ -7,9 +7,10 @@
     2. 关键点标注    -> store/{CAMERA_NAME}/keypoints.json
     3. 横向直线标注  -> store/{CAMERA_NAME}/manual_horizontal.json
     4. 纵向直线标注  -> store/{CAMERA_NAME}/manual_vertical.json
-    5. 训练区域      -> store/{CAMERA_NAME}/train_area.json
-    6. 标志物分组    -> store/manual/{CAMERA_NAME}/markers.json
-    7. 保存与测量    -> 运行 measure_marker_position.py
+    5. 四条边线标定  -> store/{CAMERA_NAME}/field_boundary.json（可选）
+    6. 训练区域      -> store/{CAMERA_NAME}/train_area.json
+    7. 器材分组      -> store/manual/{CAMERA_NAME}/markers.json
+    8. 保存与测量    -> 运行 measure_marker_position.py
 
 生成的 JSON 与主流程 (camera.py / de_distortion.py / measure_marker_position.py)
 完全兼容；启动时自动加载已有标注缓存，保存时直接写入规范路径。
@@ -23,6 +24,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import subprocess
@@ -134,7 +136,81 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from PIL import Image, ImageTk
 import yaml
 
+from marker_group_model import (
+    DEFAULT_EQUIPMENT_TYPE,
+    build_marker_data,
+    effective_marker_group_count,
+    load_marker_groups,
+    normalize_equipment_type,
+    resize_marker_groups,
+    measurement_group_source_indices,
+    sync_measurement_group_configs,
+)
+from field_boundary import (
+    compute_boundary_homography,
+    load_boundary,
+    validate_boundary_data,
+)
 import soccer
+
+
+def _save_annotation_file(path: Path, data: Dict[str, Any],
+                          derived_cache_paths: Tuple[Path, ...] = ()) -> bool:
+    """Save an annotation and invalidate its derived caches only if it changed.
+
+    Cache files are removed before the new annotation is written: if removal fails,
+    the old annotation remains in place instead of silently using stale results.
+    Returns whether the serialized annotation differs from the saved file.
+    """
+    content = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    try:
+        if path.read_bytes() == content:
+            return False
+    except FileNotFoundError:
+        pass
+
+    for cache_path in derived_cache_paths:
+        cache_path.unlink(missing_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return True
+
+
+def _validate_saved_keypoints(data: Dict[str, Any], pitch_config: Any
+                              ) -> List[Tuple[int, Tuple[int, int]]]:
+    """Reject pixel points whose saved pitch coordinates belong to another preset."""
+    if not isinstance(data, dict):
+        raise ValueError("关键点文件格式不正确")
+    expected_type = pitch_config.__class__.__name__
+    saved_type = data.get("config_type")
+    if saved_type != expected_type:
+        raise ValueError(f"保存的场地配置为 {saved_type or '未记录'}，当前为 {expected_type}")
+
+    annotations = data.get("annotations")
+    if not isinstance(annotations, list):
+        raise ValueError("关键点列表格式不正确")
+    vertices = pitch_config.vertices
+    validated = []
+    for item in annotations:
+        try:
+            index = int(item["vertex_index"])
+            if not 0 <= index < len(vertices):
+                raise ValueError(f"顶点编号 {index} 不在当前场地配置中")
+            saved_world = item["world_coord"]
+            if len(saved_world) != 2:
+                raise ValueError(f"顶点 {index} 的世界坐标格式不正确")
+            expected_world = vertices[index]
+            if any(not math.isfinite(float(saved_world[axis])) or
+                   abs(float(saved_world[axis]) - float(expected_world[axis])) > 1.0
+                   for axis in (0, 1)):
+                raise ValueError(f"顶点 {index} 的世界坐标与当前场地配置不一致")
+            image = item["img_coord"]
+            if len(image) != 2:
+                raise ValueError(f"顶点 {index} 的图像坐标格式不正确")
+            validated.append((index, (int(image[0]), int(image[1]))))
+        except (KeyError, TypeError, IndexError, OverflowError) as exc:
+            raise ValueError("关键点文件包含无效的顶点或坐标") from exc
+    return validated
 
 # ======================================================================
 # 平台相关 UI 常量与辅助
@@ -169,6 +245,17 @@ def wheel_steps(event) -> int:
 
 
 Point = Tuple[int, int]
+BOUNDARY_KEYS = ("top", "right", "bottom", "left")
+BOUNDARY_LABELS = {
+    "top": "上边线（球场 y=0）",
+    "right": "右端线（球场 x=长度）",
+    "bottom": "下边线（球场 y=宽度）",
+    "left": "左端线（球场 x=0）",
+}
+BOUNDARY_COLORS = {
+    "top": "#22c55e", "right": "#38bdf8",
+    "bottom": "#f59e0b", "left": "#f472b6",
+}
 
 
 @dataclass
@@ -192,12 +279,13 @@ STEP_DEFS: List[StepDef] = [
         "确认视频文件、相机名称和场地配置。\n\n"
         "「应用并保存配置」会更新根目录 config.yaml，\n"
         "后续所有标注文件都会保存到\n"
-        "store/{相机名}/ 与 store/manual/{相机名}/ 下。",
+        "store/{相机名}/ 与 store/manual/{相机名}/ 下。\n\n"
+        "器材组数、每组器材类型在第 7 步设置。",
     ),
     StepDef(
         "keypoints",
         "关键点标注",
-        "在画面中标注球场关键点（用于计算单应矩阵）。\n\n"
+        "在画面中标注球场关键点（旧模式用于计算单应矩阵；启用四边标定时可跳过）。\n\n"
         "1. 在下拉框选择顶点编号（可点「查看场地图编号」对照）\n"
         "2. 左键在画面中点击该关键点的位置\n"
         "3. 标注后自动跳到下一个未标注的顶点\n\n"
@@ -223,6 +311,17 @@ STEP_DEFS: List[StepDef] = [
         "建议至少标注 2 条分布在画面不同位置的纵线。",
     ),
     StepDef(
+        "field_boundary",
+        "四条边线标定",
+        "可选：按球场示意图依次选择上、右、下、左边线，"
+        "每条在画面中点击两个位置。看不清的边线可按已有线索推定，"
+        "请勾选『推定』以记录不确定性。\n\n"
+        "保存后，主流程优先使用四条边线求场地映射，并以其范围筛选球员；"
+        "无需先标旧关键点。未保存时完全沿用旧模式。"
+        "四条边线都标完后，请预览球场线投影并核对方向。",
+        optional=True,
+    ),
+    StepDef(
         "train_area",
         "训练区域",
         "定义球场上的训练区域（可选步骤）。\n\n"
@@ -230,16 +329,16 @@ STEP_DEFS: List[StepDef] = [
         "（用于关键点之外的位置，如中场某处）\n\n"
         "步骤 B：在下方输入构成区域的点序列，\n"
         "可混用球场关键点标签和 V 点，如：1, 14, V1, V2\n"
-        "点「生成区域」转换为球场坐标（需先完成关键点标注）。\n\n"
+        "点「生成区域」转换为球场坐标（四边模式用四边映射，旧模式用关键点）。\n\n"
         "区域至少 3 个点。跳过此步则由主流程交互标定。",
         optional=True,
     ),
     StepDef(
         "markers",
-        "标志物分组",
+        "器材分组",
         "标注要测量的标志物（如障碍桶）。\n\n"
-        "每组代表一类标志物（如一排桶）：\n"
-        "左键添加点，「新建分组」开始下一组。\n\n"
+        "先设置器材组数，并为当前组选择或输入器材类型。\n"
+        "切换组后左键添加点；每组至少标注一个点。\n\n"
         "组内/组间距离的计算方式由 config.yaml 中的\n"
         "GROUP_CONFIGS / PAIR_CONFIGS 决定。",
     ),
@@ -249,8 +348,8 @@ STEP_DEFS: List[StepDef] = [
         "检查各步骤完成情况，一键保存全部标注，\n"
         "并运行测量流程生成报告与可视化。\n\n"
         "注意：畸变参数由主流程自动计算；\n"
-        "若重新标注了关键点或横纵线，请先清理派生缓存，\n"
-        "否则主流程会直接使用旧的畸变参数。",
+        "关键点、横纵线或边线内容变化并保存时会自动清理相关旧缓存。\n"
+        "升级程序而标注未变化时，可手动清理派生缓存后重算。",
     ),
 ]
 
@@ -286,6 +385,7 @@ class AnnotationClient(tk.Tk):
         self.camera_name = self.config_data.get("CAMERA_NAME") or "camera1"
 
         self.status = tk.StringVar(value="就绪")
+        self._keypoint_geometry_warning: Optional[str] = None
         self.frame_index = tk.IntVar(value=0)
         self.scale = 1.0
         self.offset_x = 0
@@ -298,15 +398,38 @@ class AnnotationClient(tk.Tk):
 
         # ---- 标注数据 ----
         self.keypoints: List[KeypointAnnotation] = []
-        self.marker_groups: List[List[Point]] = [[]]
+        configured_groups = self.config_data.get("GROUP_CONFIGS")
+        configured_indices = []
+        if isinstance(configured_groups, list):
+            for item in configured_groups:
+                try:
+                    configured_indices.append(int(item["group"]))
+                except (TypeError, KeyError, ValueError):
+                    continue
+        configured_count = max(configured_indices, default=0) + 1
+        self.marker_groups: List[List[Point]] = [[] for _ in range(max(1, min(99, configured_count)))]
+        self.marker_equipment_types: List[str] = [DEFAULT_EQUIPMENT_TYPE] * len(self.marker_groups)
+        self._config_source_indices = list(range(len(self.marker_groups)))
         self.manual_h_groups: List[List[Point]] = [[]]
         self.manual_v_groups: List[List[Point]] = [[]]
+        self.boundary_edges: Dict[str, List[Point]] = {key: [] for key in BOUNDARY_KEYS}
+        self.boundary_edge_var = tk.StringVar(value="top")
+        self.boundary_enabled_var = tk.BooleanVar(value=True)
+        self.boundary_estimated_vars = {
+            key: tk.BooleanVar(value=False) for key in BOUNDARY_KEYS
+        }
+        self.boundary_status_var = tk.StringVar(value="四条边线各标记两个点后可保存")
+        self.boundary_preview_lines = False
+        self.boundary_source_name = ""
         self.train_area_points: List[Point] = []       # 视频画面自定义点 V1..Vn
         self.train_area_region: List[List[float]] = []  # 球场坐标区域点 (cm)
         self.train_area_tokens = tk.StringVar(value="")
 
         self.current_step_index = 0
         self.current_group = tk.IntVar(value=1)
+        self.marker_group_count_var = tk.StringVar(value=str(len(self.marker_groups)))
+        self.marker_equipment_type_var = tk.StringVar(value=DEFAULT_EQUIPMENT_TYPE)
+        self._active_marker_type_index = 0
         self.selected_vertex = tk.IntVar(value=0)
 
         # 项目设置变量
@@ -315,17 +438,9 @@ class AnnotationClient(tk.Tk):
         self.store_root = self.config_data.get("store_dir") or "store"
         self.store_root_var = tk.StringVar(value=self.store_root)
 
-        # 测量配置变量
-        self.num_marker_groups = tk.IntVar(value=2)
-        self.group_config_widgets: List[Dict[str, Any]] = []
-        self.pair_enabled_vars: Dict[Tuple[int, int], tk.BooleanVar] = {}
-        self.pair_type_vars: Dict[Tuple[int, int], tk.StringVar] = {}
-        self._group_closed_vars: Dict[int, tk.BooleanVar] = {}
-        self._build_measurement_config_defaults()
-        self.num_marker_groups.trace_add("write", lambda *_: self._on_num_groups_changed())
-
         self._load_existing_annotations()
         self._build_ui()
+        self.marker_equipment_type_var.trace_add("write", self._remember_marker_equipment_type)
         self._refresh_vertex_options()
         self._select_step(self._first_incomplete_step())
         self._fit_image()
@@ -396,6 +511,7 @@ class AnnotationClient(tk.Tk):
             "keypoints": self._store_dir() / "keypoints.json",
             "manual_h": self._store_dir() / "manual_horizontal.json",
             "manual_v": self._store_dir() / "manual_vertical.json",
+            "field_boundary": self._store_dir() / "field_boundary.json",
             "train_area": self._store_dir() / "train_area.json",
             "markers": self._manual_dir() / "markers.json",
         }.get(key)
@@ -460,10 +576,21 @@ class AnnotationClient(tk.Tk):
         self.status.set(f"已加载帧 {self.frame_index.get()}，来源：{self.source_path.name}")
 
     def set_frame(self, frame) -> None:
+        old_size = (self.image_w, self.image_h)
         self.frame_bgr = frame
         self.image_h, self.image_w = frame.shape[:2]
+        boundary_reset = old_size != (self.image_w, self.image_h) and any(
+            self.boundary_edges.values())
+        if boundary_reset:
+            self.boundary_edges = {key: [] for key in BOUNDARY_KEYS}
+            self.boundary_preview_lines = False
+            self.boundary_status_var.set("画面尺寸变化，已清除内存中的边线点；原标定文件未改动")
         self._fit_image()
         self._redraw()
+        if boundary_reset:
+            self._refresh_step_list()
+        if self.current_step.key == "field_boundary":
+            self._refresh_boundary_status()
 
     # ------------------------------------------------------------------
     # 已有标注自动加载
@@ -471,18 +598,30 @@ class AnnotationClient(tk.Tk):
 
     def _load_existing_annotations(self) -> None:
         loaded = []
+        self.keypoints = []
+        self.boundary_edges = {key: [] for key in BOUNDARY_KEYS}
+        self.boundary_preview_lines = False
+        self.boundary_source_name = ""
+        self.boundary_enabled_var.set(True)
+        for value in self.boundary_estimated_vars.values():
+            value.set(False)
+        self._keypoint_geometry_warning = None
         path = self._step_save_path("keypoints")
         if path and path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 self.keypoints = [
-                    KeypointAnnotation(int(item["vertex_index"]),
-                                       (int(item["img_coord"][0]), int(item["img_coord"][1])))
-                    for item in data.get("annotations", [])
+                    KeypointAnnotation(index, image)
+                    for index, image in _validate_saved_keypoints(data, self.pitch_config)
                 ]
                 loaded.append(f"关键点 {len(self.keypoints)} 个")
-            except Exception:
-                pass
+            except (OSError, ValueError, TypeError) as exc:
+                self._keypoint_geometry_warning = f"已有关键点未加载：{exc}"
+                messagebox.showwarning(
+                    "场地配置与关键点不匹配",
+                    f"{self._keypoint_geometry_warning}\n\n原文件保持不变：\n{path}\n\n"
+                    "请核对场地配置后重新标注关键点；若要保留旧标注，请使用新的相机名称。",
+                )
 
         for key, attr in (("manual_h", "manual_h_groups"),
                           ("manual_v", "manual_v_groups"),
@@ -491,16 +630,46 @@ class AnnotationClient(tk.Tk):
             if path and path.exists():
                 try:
                     data = json.loads(path.read_text(encoding="utf-8"))
-                    groups = []
-                    for group in sorted(data.get("groups", []), key=lambda g: g.get("group_id", 0)):
-                        pts = [(int(p["img_coord"][0]), int(p["img_coord"][1]))
-                               for p in group.get("points", [])]
-                        groups.append(pts)
+                    if key == "markers":
+                        groups, equipment_types = load_marker_groups(data)
+                    else:
+                        groups = []
+                        for group in sorted(data.get("groups", []), key=lambda g: g.get("group_id", 0)):
+                            pts = [(int(p["img_coord"][0]), int(p["img_coord"][1]))
+                                   for p in group.get("points", [])]
+                            groups.append(pts)
                     if groups:
                         setattr(self, attr, groups)
+                        if key == "markers":
+                            self.marker_equipment_types = equipment_types
+                            self.marker_group_count_var.set(str(len(groups)))
                         loaded.append(f"{key} {len(groups)} 组")
                 except Exception:
                     pass
+
+        path = self._step_save_path("field_boundary")
+        if path and path.exists():
+            try:
+                data = load_boundary(
+                    path, self.camera_name, self.pitch_config,
+                    (self.image_w, self.image_h),
+                )
+                for key in BOUNDARY_KEYS:
+                    self.boundary_edges[key] = [
+                        (int(x), int(y)) for x, y in data["edges"][key]["points"]
+                    ]
+                    self.boundary_estimated_vars[key].set(
+                        bool(data["edges"][key].get("estimated", False))
+                    )
+                self.boundary_enabled_var.set(bool(data["enabled"]))
+                self.boundary_source_name = str(data.get("source") or "")
+                loaded.append("四条边线" if data["enabled"] else "四条边线已停用")
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                messagebox.showwarning(
+                    "边线标定未加载",
+                    f"{exc}\n\n文件未改动：\n{path}\n"
+                    "请核对当前相机、场地配置和画面尺寸后重新标定。",
+                )
 
         path = self._step_save_path("train_area")
         if path and path.exists():
@@ -516,7 +685,9 @@ class AnnotationClient(tk.Tk):
             except Exception:
                 pass
 
-        if loaded:
+        if self._keypoint_geometry_warning:
+            self.status.set("⚠ " + self._keypoint_geometry_warning)
+        elif loaded:
             self.status.set("已自动加载缓存：" + "、".join(loaded))
 
     # ------------------------------------------------------------------
@@ -532,10 +703,12 @@ class AnnotationClient(tk.Tk):
             return any(len(g) >= 2 for g in self.manual_h_groups)
         if key == "manual_v":
             return any(len(g) >= 2 for g in self.manual_v_groups)
+        if key == "field_boundary":
+            return all(len(self.boundary_edges[name]) == 2 for name in BOUNDARY_KEYS)
         if key == "train_area":
             return len(self.train_area_region) >= 3
         if key == "markers":
-            return any(g for g in self.marker_groups)
+            return bool(self.marker_groups) and all(self.marker_groups)
         if key == "finish":
             return (self._manual_dir() / "measurement_report.txt").exists()
         return False
@@ -573,6 +746,7 @@ class AnnotationClient(tk.Tk):
             ("keypoints.json", self._step_save_path("keypoints")),
             ("manual_horizontal.json", self._step_save_path("manual_h")),
             ("manual_vertical.json", self._step_save_path("manual_v")),
+            ("field_boundary.json", self._step_save_path("field_boundary")),
             ("distortion_params.json", self._store_dir() / "distortion_params.json"),
             ("train_area.json", self._step_save_path("train_area")),
             ("markers.json", self._step_save_path("markers")),
@@ -626,7 +800,7 @@ class AnnotationClient(tk.Tk):
         cache_box.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         cache_box.columnconfigure(0, weight=1)
         self.cache_text = tk.Text(
-            cache_box, height=8, width=28, relief="flat",
+            cache_box, height=9, width=28, relief="flat",
             font=(MONO_FONT, 9), state="disabled", background=self.cget("background"),
         )
         self.cache_text.grid(row=0, column=0, sticky="ew")
@@ -734,6 +908,7 @@ class AnnotationClient(tk.Tk):
         self._build_keypoints_panel(self.step_panels["keypoints"])
         self._build_groups_panel(self.step_panels["manual_h"], "横线")
         self._build_groups_panel(self.step_panels["manual_v"], "纵线")
+        self._build_boundary_panel(self.step_panels["field_boundary"])
         self._build_train_area_panel(self.step_panels["train_area"])
         self._build_groups_panel(self.step_panels["markers"], "标志物")
         self._build_finish_panel(self.step_panels["finish"])
@@ -796,147 +971,15 @@ class AnnotationClient(tk.Tk):
         )
         self.pitch_config_combo.grid(row=10, column=0, sticky="ew", pady=(0, 8))
 
-        # ---- 标志物测量配置 ----
-        measure_box = ttk.LabelFrame(panel, text="标志物测量配置", padding=8)
-        measure_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        measure_box.columnconfigure(0, weight=1)
-
-        # 组数选择
-        groups_header = ttk.Frame(measure_box)
-        groups_header.grid(row=0, column=0, sticky="ew")
-        groups_header.columnconfigure(2, weight=1)
-        ttk.Label(groups_header, text="器材组数").grid(row=0, column=0, sticky="w")
-        self.num_groups_spin = ttk.Spinbox(
-            groups_header, from_=1, to=9, width=5,
-            textvariable=self.num_marker_groups,
-            command=self._on_num_groups_changed,
-        )
-        self.num_groups_spin.grid(row=0, column=1, padx=(8, 0), sticky="w")
-
-        # 每组配置区域（动态生成）
-        self.group_configs_frame = ttk.Frame(measure_box)
-        self.group_configs_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        self.group_configs_frame.columnconfigure(0, weight=1)
-
-        # 组间距离配置区域
-        pair_header = ttk.Frame(measure_box)
-        pair_header.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Label(pair_header, text="组间距离测量", font=(UI_FONT, 10, "bold")).grid(
-            row=0, column=0, sticky="w")
-        self.pair_configs_frame = ttk.Frame(measure_box)
-        self.pair_configs_frame.grid(row=3, column=0, sticky="ew", pady=(4, 0))
-        self.pair_configs_frame.columnconfigure(0, weight=1)
-
         ttk.Button(box, text="应用并保存配置 (config.yaml)",
                    command=self.apply_setup).grid(row=11, column=0, sticky="ew")
+        ttk.Label(box, text="器材组数和器材类型请在第 7 步设置。",
+                  foreground="#475569", wraplength=280, justify="left").grid(
+                      row=12, column=0, sticky="w", pady=(12, 4))
+        ttk.Button(box, text="前往第 7 步 · 设置器材组数和类型",
+                   command=lambda: self._select_step(STEP_KEYS.index("markers"))).grid(
+                       row=13, column=0, sticky="ew")
         self._refresh_store_dir_hint()
-        self._rebuild_group_configs()
-        self._rebuild_pair_configs()
-
-    # ------------------------------------------------------------------
-    # 测量配置 UI 辅助方法
-    # ------------------------------------------------------------------
-
-    def _build_measurement_config_defaults(self) -> None:
-        """从 config.yaml 加载 GROUP_CONFIGS / PAIR_CONFIGS 初始化变量"""
-        group_cfgs = self.config_data.get("GROUP_CONFIGS") or [
-            {"group": 0, "is_closed": False}, {"group": 1, "is_closed": False}
-        ]
-        pair_cfgs = self.config_data.get("PAIR_CONFIGS") or []
-
-        max_g = 0
-        self._group_closed_vars: Dict[int, tk.BooleanVar] = {}
-        for gc in group_cfgs:
-            g = gc.get("group", 0)
-            max_g = max(max_g, g)
-            self._group_closed_vars[g] = tk.BooleanVar(value=gc.get("is_closed", False))
-        self.num_marker_groups.set(max(max_g + 1, 2))
-
-        for pc in pair_cfgs:
-            g1 = pc.get("group1", 0)
-            g2 = pc.get("group2", 1)
-            key = (g1, g2)
-            self.pair_enabled_vars[key] = tk.BooleanVar(value=True)
-            self.pair_type_vars[key] = tk.StringVar(value=pc.get("type", "both"))
-
-    def _on_num_groups_changed(self) -> None:
-        """组数改变时，动态重建每组配置和组间配置"""
-        self._rebuild_group_configs()
-        self._rebuild_pair_configs()
-
-    def _rebuild_group_configs(self) -> None:
-        """重建每组的配置行（环形/线形复选框）"""
-        if not hasattr(self, "group_configs_frame"):
-            return
-        for w in self.group_configs_frame.winfo_children():
-            w.destroy()
-        self.group_config_widgets.clear()
-
-        n = max(1, int(self.num_marker_groups.get()))
-        for i in range(n):
-            if i not in self._group_closed_vars:
-                self._group_closed_vars[i] = tk.BooleanVar(value=False)
-            row = ttk.Frame(self.group_configs_frame)
-            row.grid(row=i, column=0, sticky="ew", pady=1)
-            ttk.Label(row, text=f"第 {i+1} 组").grid(row=0, column=0, sticky="w")
-            closed_var = self._group_closed_vars[i]
-            cb = ttk.Checkbutton(row, text="环形（闭合）", variable=closed_var)
-            cb.grid(row=0, column=1, padx=(12, 0), sticky="w")
-            self.group_config_widgets.append({"frame": row, "closed_var": closed_var})
-
-    def _rebuild_pair_configs(self) -> None:
-        """重建组间距离配置行"""
-        if not hasattr(self, "pair_configs_frame"):
-            return
-        for w in self.pair_configs_frame.winfo_children():
-            w.destroy()
-
-        n = max(1, int(self.num_marker_groups.get()))
-        row_idx = 0
-        for i in range(n):
-            for j in range(i + 1, n):
-                key = (i, j)
-                if key not in self.pair_enabled_vars:
-                    self.pair_enabled_vars[key] = tk.BooleanVar(value=False)
-                if key not in self.pair_type_vars:
-                    self.pair_type_vars[key] = tk.StringVar(value="center")
-                enabled_var = self.pair_enabled_vars[key]
-                type_var = self.pair_type_vars[key]
-
-                row = ttk.Frame(self.pair_configs_frame)
-                row.grid(row=row_idx, column=0, sticky="ew", pady=1)
-                ttk.Checkbutton(row, text=f"组{i+1} ↔ 组{j+1}",
-                                variable=enabled_var).grid(row=0, column=0, sticky="w")
-                ttk.Label(row, text="  方式:").grid(row=0, column=1, sticky="w")
-                cb = ttk.Combobox(row, textvariable=type_var, width=10, state="readonly",
-                                  values=["center", "nearest", "both"])
-                cb.grid(row=0, column=2, padx=(4, 0), sticky="w")
-                row_idx += 1
-
-    def _collect_group_configs(self) -> List[Dict[str, Any]]:
-        """从 GUI 收集 GROUP_CONFIGS"""
-        configs = []
-        n = max(1, int(self.num_marker_groups.get()))
-        for i in range(n):
-            is_closed = False
-            if i in self._group_closed_vars:
-                is_closed = bool(self._group_closed_vars[i].get())
-            configs.append({"group": i, "is_closed": is_closed})
-        return configs
-
-    def _collect_pair_configs(self) -> List[Dict[str, Any]]:
-        """从 GUI 收集 PAIR_CONFIGS"""
-        configs = []
-        n = max(1, int(self.num_marker_groups.get()))
-        for i in range(n):
-            for j in range(i + 1, n):
-                key = (i, j)
-                enabled = self.pair_enabled_vars.get(key)
-                if enabled and enabled.get():
-                    ptype = self.pair_type_vars.get(key)
-                    ptype_val = ptype.get() if ptype else "center"
-                    configs.append({"group1": i, "group2": j, "type": ptype_val})
-        return configs
 
     def browse_store_root(self) -> None:
         path = filedialog.askdirectory(initialdir=str(self._resolve_store_root().parent
@@ -978,6 +1021,9 @@ class AnnotationClient(tk.Tk):
         minimap_legend.grid(row=1, column=0, sticky="w", pady=(4, 0))
 
     def _build_groups_panel(self, panel: ttk.Frame, noun: str) -> None:
+        if noun == "标志物":
+            self._build_marker_groups_panel(panel)
+            return
         box = ttk.LabelFrame(panel, text=f"{noun}分组", padding=8)
         box.grid(row=0, column=0, sticky="ew")
         box.columnconfigure(0, weight=1)
@@ -989,6 +1035,90 @@ class AnnotationClient(tk.Tk):
                     width=6, command=self.ensure_group).grid(row=0, column=1, sticky="e")
         ttk.Button(box, text=f"新建分组（下一条{noun}）", command=self.new_group).grid(
             row=1, column=0, sticky="ew", pady=(8, 0))
+
+    def _build_boundary_panel(self, panel: ttk.Frame) -> None:
+        box = ttk.LabelFrame(panel, text="四条场地边线", padding=8)
+        box.grid(row=0, column=0, sticky="ew")
+        box.columnconfigure(0, weight=1)
+        self.boundary_count_labels: Dict[str, ttk.Label] = {}
+        for row_index, key in enumerate(BOUNDARY_KEYS):
+            row = ttk.Frame(box)
+            row.grid(row=row_index, column=0, sticky="ew", pady=(0, 6))
+            row.columnconfigure(0, weight=1)
+            ttk.Radiobutton(
+                row, text=BOUNDARY_LABELS[key], value=key,
+                variable=self.boundary_edge_var,
+                command=self._refresh_boundary_status,
+            ).grid(row=0, column=0, sticky="w")
+            count_label = ttk.Label(row, text="0/2")
+            count_label.grid(row=0, column=1, padx=(4, 6))
+            self.boundary_count_labels[key] = count_label
+            ttk.Checkbutton(
+                row, text="推定", variable=self.boundary_estimated_vars[key],
+            ).grid(row=0, column=2, sticky="e")
+
+        ttk.Button(box, text="清除选中边线", command=self.clear_selected_boundary_edge).grid(
+            row=4, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(box, text="检查并预览四边范围", command=self.preview_boundary).grid(
+            row=5, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(box, text="查看场地图编号与方向", command=self.open_field_reference).grid(
+            row=6, column=0, sticky="ew", pady=(6, 0))
+        ttk.Checkbutton(
+            box, text="启用四边标定（关闭后使用旧模式）",
+            variable=self.boundary_enabled_var,
+            command=self._refresh_boundary_status,
+        ).grid(row=7, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(
+            box, textvariable=self.boundary_status_var, wraplength=285,
+            justify="left", foreground="#475569",
+        ).grid(row=8, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(
+            panel,
+            text="边线名称按场地坐标命名，不按画面上下左右命名。"
+                 "看不清的边线请标为“推定”；黄色虚线是按四边投影的球场线，"
+                 "请对照可见中线、禁区线核对方向与位置。",
+            wraplength=300, justify="left", foreground="#475569",
+        ).grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self._refresh_boundary_status()
+
+    def _build_marker_groups_panel(self, panel: ttk.Frame) -> None:
+        box = ttk.LabelFrame(panel, text="器材分组设置", padding=8)
+        box.grid(row=0, column=0, sticky="ew")
+        box.columnconfigure(0, weight=1)
+
+        ttk.Label(box, text="器材组数（1–99 组）").grid(row=0, column=0, sticky="w")
+        count_row = ttk.Frame(box)
+        count_row.grid(row=1, column=0, sticky="ew", pady=(3, 10))
+        count_row.columnconfigure(0, weight=1)
+        count_spin = ttk.Spinbox(count_row, from_=1, to=99,
+                                 textvariable=self.marker_group_count_var, width=8)
+        count_spin.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        count_spin.bind("<Return>", lambda _event: self.apply_marker_group_count())
+        ttk.Button(count_row, text="应用组数", command=self.apply_marker_group_count).grid(
+            row=0, column=1, sticky="e")
+
+        ttk.Label(box, text="当前标注组").grid(row=2, column=0, sticky="w")
+        current_group_spin = ttk.Spinbox(box, from_=1, to=99,
+                                         textvariable=self.current_group, width=8,
+                                         command=self.select_marker_group)
+        current_group_spin.grid(row=3, column=0, sticky="ew", pady=(3, 10))
+        current_group_spin.bind("<Return>", lambda _event: self.select_marker_group())
+        current_group_spin.bind("<FocusOut>", lambda _event: self.select_marker_group())
+
+        ttk.Label(box, text="当前组器材类型（可选择或自行输入）").grid(
+            row=4, column=0, sticky="w")
+        ttk.Combobox(
+            box,
+            textvariable=self.marker_equipment_type_var,
+            values=("未指定", "标志桶", "标志碟", "标志杆", "跨栏", "小球门", "敏捷梯", "其他"),
+            state="normal",
+        ).grid(row=5, column=0, sticky="ew", pady=(3, 8))
+
+        ttk.Button(box, text="新增一组器材", command=self.new_group).grid(
+            row=6, column=0, sticky="ew")
+        ttk.Label(box, text="每组在画面中至少标注一个点；保存后类型会写入 markers.json。",
+                  foreground="#475569", wraplength=280, justify="left").grid(
+                      row=7, column=0, sticky="w", pady=(8, 0))
 
     def _build_train_area_panel(self, panel: ttk.Frame) -> None:
         box = ttk.LabelFrame(panel, text="区域构成", padding=8)
@@ -1040,11 +1170,7 @@ class AnnotationClient(tk.Tk):
         self._select_step(max(0, self.current_step_index - 1))
 
     def next_step(self) -> None:
-        step = self.current_step
-        # 离开可标注步骤时提示未保存的必要条件
-        if step.key == "keypoints" and 0 < len(self.keypoints) < 4:
-            messagebox.showwarning("关键点", "关键点少于 4 个，单应矩阵无法计算，请继续标注。")
-            return
+        # 四边模式可跳过旧关键点步骤；真正的必要条件在测量前按模式检查。
         self._select_step(min(len(STEP_DEFS) - 1, self.current_step_index + 1))
 
     def _select_step(self, index: int) -> None:
@@ -1062,10 +1188,14 @@ class AnnotationClient(tk.Tk):
             savable = step.key not in ("setup", "finish")
             self.save_step_button.state(["!disabled"] if savable else ["disabled"])
         self.current_group.set(1)
+        if step.key == "markers":
+            self._sync_marker_group_controls()
         if step.key == "finish":
             self._refresh_finish_summary()
         if step.key == "keypoints":
             self._refresh_keypoint_progress()
+        if step.key == "field_boundary":
+            self._refresh_boundary_status()
         self._refresh_step_list()
         self._redraw()
 
@@ -1079,7 +1209,17 @@ class AnnotationClient(tk.Tk):
             lines.append(f"{icon}  {i + 1}. {step.title}")
         distortion = self._store_dir() / "distortion_params.json"
         lines.append("")
-        lines.append("畸变参数：" + ("已缓存（如重标过直线请清理）" if distortion.exists() else "将由主流程自动计算"))
+        lines.append("畸变参数：" + ("已缓存（标注变化后自动清理）" if distortion.exists() else "将由主流程自动计算"))
+        boundary = self._step_save_path("field_boundary")
+        boundary_enabled = False
+        if boundary.exists():
+            try:
+                boundary_enabled = bool(json.loads(boundary.read_text(encoding="utf-8"))
+                                        .get("enabled", True))
+            except (OSError, ValueError, TypeError, AttributeError):
+                lines.append("场地边界：标定文件异常，请修复后运行")
+        if not any(line.startswith("场地边界：") for line in lines):
+            lines.append("场地边界：" + ("四边标定优先" if boundary_enabled else "旧模式"))
         self.finish_summary.configure(text="\n".join(lines))
 
     # ------------------------------------------------------------------
@@ -1107,24 +1247,28 @@ class AnnotationClient(tk.Tk):
 
         name_changed = new_name != self.camera_name
         root_changed = new_root != self.store_root
+        config_name = self.selected_pitch_config.get()
+        config_changed = config_name != self.pitch_config.__class__.__name__
         self.camera_name = new_name
         self.store_root = new_root
         self.source_path = video
 
-        config_name = self.selected_pitch_config.get()
         self.pitch_config = self._load_pitch_config(config_name)
         self._refresh_vertex_options()
 
         self._write_config_yaml()
         self._refresh_store_dir_hint()
-        if name_changed or root_changed:
-            self._load_existing_annotations()
         frame = self._read_video_frame(video, self.frame_index.get())
         if frame is not None:
             self.set_frame(frame)
+        if name_changed or root_changed or config_changed:
+            self._load_existing_annotations()
         self._refresh_step_list()
         self._redraw()
-        self.status.set(f"配置已保存：相机 {self.camera_name}，场地 {config_name}")
+        if self._keypoint_geometry_warning:
+            self.status.set("⚠ " + self._keypoint_geometry_warning)
+        else:
+            self.status.set(f"配置已保存：相机 {self.camera_name}，场地 {config_name}")
 
     def _write_config_yaml(self) -> None:
         video = Path(self.video_path_var.get().strip() or self._default_video_path())
@@ -1135,13 +1279,17 @@ class AnnotationClient(tk.Tk):
         data["config"] = self.selected_pitch_config.get()
         data["store_dir"] = self.store_root
         data.setdefault("MCS_NAME", None)
-        data["GROUP_CONFIGS"] = self._collect_group_configs()
-        data["PAIR_CONFIGS"] = self._collect_pair_configs()
+        source_indices = measurement_group_source_indices(self.marker_groups)
+        sync_measurement_group_configs(
+            data, effective_marker_group_count(self.marker_groups), source_indices,
+            self._config_source_indices,
+        )
         data.setdefault("jac", "3-point")
         data.setdefault("reprojection_eps", 5.0)
         data.setdefault("enable_orientation", True)
         with (self.project_dir / "config.yaml").open("w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+        self._config_source_indices = source_indices
 
     # ------------------------------------------------------------------
     # 关键点
@@ -1186,6 +1334,109 @@ class AnnotationClient(tk.Tk):
             need = "（已满足最少 4 个）" if done >= 4 else f"（至少还需 {4 - done} 个）"
             self.keypoint_progress.configure(text=f"已标注 {done}/{total} 个顶点 {need}")
         self._draw_pitch_minimap()
+
+    def _refresh_boundary_status(self) -> None:
+        if hasattr(self, "boundary_count_labels"):
+            for key in BOUNDARY_KEYS:
+                self.boundary_count_labels[key].configure(
+                    text=f"{len(self.boundary_edges[key])}/2")
+        selected = self.boundary_edge_var.get()
+        count = len(self.boundary_edges.get(selected, []))
+        if all(len(self.boundary_edges[key]) == 2 for key in BOUNDARY_KEYS):
+            mode = "启用四边标定" if self.boundary_enabled_var.get() else "使用旧模式"
+            self.boundary_status_var.set(
+                f"四条边线已标齐。请检查轮廓，再点“保存本步”选择{mode}。")
+        else:
+            self.boundary_status_var.set(
+                f"当前：{BOUNDARY_LABELS.get(selected, selected)}，已标 {count}/2 点。"
+                "每条线选两个相距较远的位置。")
+        if (self.boundary_source_name and self.source_path and
+                Path(self.boundary_source_name).name != self.source_path.name):
+            self.boundary_status_var.set(
+                self.boundary_status_var.get() + "\n注意：边线取自另一视频/图片；"
+                "请确认是同一固定机位且构图未变。")
+
+    def _build_boundary_data(self) -> Dict[str, Any]:
+        if not all(len(self.boundary_edges[key]) == 2 for key in BOUNDARY_KEYS):
+            # 停用已经保存的四边模式不应要求重新画完内存中的线，
+            # 但仍保留旧几何以便之后重新启用。
+            saved_path = self._step_save_path("field_boundary")
+            if not self.boundary_enabled_var.get() and saved_path.exists():
+                previous = load_boundary(
+                    saved_path, self.camera_name, self.pitch_config,
+                    (self.image_w, self.image_h),
+                )
+                return {**previous, "enabled": False}
+            remaining = [BOUNDARY_LABELS[key] for key in BOUNDARY_KEYS
+                         if len(self.boundary_edges[key]) != 2]
+            raise ValueError("请先给四条边线各标记两个点；未完成：" + "、".join(remaining))
+        data = {
+            "schema_version": 1,
+            "enabled": bool(self.boundary_enabled_var.get()),
+            "camera_id": self.camera_name,
+            "config_type": self.pitch_config.__class__.__name__,
+            "pitch_size_cm": [float(self.pitch_config.length), float(self.pitch_config.width)],
+            "image_size": [int(self.image_w), int(self.image_h)],
+            "source": self.source_path.name if self.source_path else "frame",
+            "frame_index": int(self.frame_index.get()),
+            "edges": {
+                key: {
+                    "points": [[int(x), int(y)] for x, y in self.boundary_edges[key]],
+                    "estimated": bool(self.boundary_estimated_vars[key].get()),
+                }
+                for key in BOUNDARY_KEYS
+            },
+        }
+        # 保存前就检查相邻边线交点和四边形，避免生成主流程无法加载的标定。
+        validate_boundary_data(
+            data, camera_id=self.camera_name, config=self.pitch_config,
+            image_size=(self.image_w, self.image_h),
+        )
+        compute_boundary_homography({**data, "enabled": True})
+        return data
+
+    def preview_boundary(self) -> None:
+        if not all(len(self.boundary_edges[key]) == 2 for key in BOUNDARY_KEYS):
+            messagebox.showwarning("四条边线标定", "请先给四条边线各标记两个点，再预览。")
+            return
+        try:
+            matrix, _quad = compute_boundary_homography(
+                {**self._build_boundary_data(), "enabled": True})
+        except ValueError as exc:
+            self.boundary_status_var.set(f"无法预览：{exc}")
+            messagebox.showwarning("四条边线标定", str(exc))
+            return
+        estimated = [BOUNDARY_LABELS[key] for key in BOUNDARY_KEYS
+                     if self.boundary_estimated_vars[key].get()]
+        suffix = "；推定线：" + "、".join(estimated) if estimated else ""
+        if self.keypoints:
+            image_points = np.asarray(
+                [item.img_coord for item in self.keypoints], dtype=np.float32,
+            ).reshape(-1, 1, 2)
+            expected = np.asarray(
+                [self.pitch_config.vertices[item.vertex_index] for item in self.keypoints],
+                dtype=np.float32,
+            )
+            projected = cv2.perspectiveTransform(image_points, matrix).reshape(-1, 2)
+            errors = np.linalg.norm(projected - expected, axis=1)
+            if np.isfinite(errors).all():
+                suffix += f"；与已标关键点的中位差 {np.median(errors) / 100:.1f} 米（仅供参考）"
+        self.boundary_status_var.set(
+            f"已计算四角和球场线投影{suffix}。"
+            "几何通过不代表真实边线正确，请核对可见的中线、禁区线与方向后保存。")
+        self.boundary_preview_lines = True
+        self.status.set("边线轮廓已预览；尚未保存，不影响旧模式")
+        self._redraw()
+
+    def clear_selected_boundary_edge(self) -> None:
+        key = self.boundary_edge_var.get()
+        if key not in self.boundary_edges:
+            return
+        self.boundary_edges[key].clear()
+        self.boundary_preview_lines = False
+        self._refresh_boundary_status()
+        self._refresh_step_list()
+        self._redraw()
 
     # ------------------------------------------------------------------
     # 场地示意图（小地图）
@@ -1342,6 +1593,17 @@ class AnnotationClient(tk.Tk):
             self.status.set(f"已标注关键点 {vertex_index}: {point}")
             self.next_unannotated_vertex()
             self._refresh_keypoint_progress()
+        elif key == "field_boundary":
+            edge_key = self.boundary_edge_var.get()
+            edge_points = self.boundary_edges[edge_key]
+            if len(edge_points) >= 2:
+                self.status.set("该边线已有两个点；请先点“清除选中边线”再重画")
+                return
+            edge_points.append(point)
+            self.boundary_preview_lines = False
+            self.status.set(
+                f"{BOUNDARY_LABELS[edge_key]}：已标 {len(edge_points)}/2 点 {point}")
+            self._refresh_boundary_status()
         elif key == "train_area":
             self.train_area_points.append(point)
             self.status.set(f"已添加自定义点 V{len(self.train_area_points)}: {point}")
@@ -1359,20 +1621,106 @@ class AnnotationClient(tk.Tk):
     # 分组 / 撤销 / 清空
     # ------------------------------------------------------------------
 
+    def _remember_marker_equipment_type(self, *_args) -> None:
+        index = self._active_marker_type_index
+        if 0 <= index < len(self.marker_equipment_types):
+            self.marker_equipment_types[index] = normalize_equipment_type(
+                self.marker_equipment_type_var.get())
+            self._refresh_list()
+
+    def _sync_marker_group_controls(self) -> None:
+        self.marker_group_count_var.set(str(len(self.marker_groups)))
+        try:
+            group_number = int(self.current_group.get())
+        except (tk.TclError, ValueError):
+            group_number = 1
+        group_number = max(1, min(group_number, len(self.marker_groups)))
+        self.current_group.set(group_number)
+        self._active_marker_type_index = group_number - 1
+        self.marker_equipment_type_var.set(self.marker_equipment_types[self._active_marker_type_index])
+
+    def apply_marker_group_count(self) -> None:
+        try:
+            target = int(self.marker_group_count_var.get().strip())
+            if not 1 <= target <= 99:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("器材组数", "请输入 1–99 之间的整数。")
+            self.marker_group_count_var.set(str(len(self.marker_groups)))
+            return
+
+        old_count = len(self.marker_groups)
+        if target < old_count:
+            removed_groups = [
+                f"第 {index + 1} 组（{len(group)} 个点，{self.marker_equipment_types[index]}）"
+                for index, group in enumerate(self.marker_groups[target:], start=target)
+                if group or self.marker_equipment_types[index] != DEFAULT_EQUIPMENT_TYPE
+            ]
+            if removed_groups and not messagebox.askyesno(
+                "减少器材组数",
+                "减少组数会删除以下组的标注点或器材类型：\n"
+                + "\n".join(removed_groups) + "\n\n确定继续吗？",
+            ):
+                self.marker_group_count_var.set(str(old_count))
+                return
+
+        self.marker_groups, self.marker_equipment_types = resize_marker_groups(
+            self.marker_groups, self.marker_equipment_types, target)
+        try:
+            selected_group = int(self.current_group.get())
+        except (tk.TclError, ValueError):
+            selected_group = 1
+        self.current_group.set(min(selected_group, target))
+        self._sync_marker_group_controls()
+        self._refresh_step_list()
+        self._redraw()
+        self.status.set(f"已设置 {target} 组器材；请为每组选择类型并在画面中标点。")
+
+    def select_marker_group(self) -> None:
+        try:
+            group_number = int(self.current_group.get())
+            if not 1 <= group_number <= 99:
+                raise ValueError
+        except (tk.TclError, ValueError):
+            messagebox.showwarning("当前标注组", "请输入 1–99 之间的组号。")
+            self.current_group.set(self._active_marker_type_index + 1)
+            return
+        if group_number > len(self.marker_groups):
+            self.marker_groups, self.marker_equipment_types = resize_marker_groups(
+                self.marker_groups, self.marker_equipment_types, group_number)
+        self._sync_marker_group_controls()
+        self._refresh_step_list()
+        self._redraw()
+
     def ensure_group(self) -> int:
-        group_number = max(1, int(self.current_group.get()))
+        try:
+            group_number = max(1, min(99, int(self.current_group.get())))
+        except (tk.TclError, ValueError):
+            group_number = 1
         groups = self._active_group_store()
         if groups is not None:
             while len(groups) < group_number:
                 groups.append([])
+                if self.current_step.key == "markers":
+                    self.marker_equipment_types.append(DEFAULT_EQUIPMENT_TYPE)
         self.current_group.set(group_number)
+        if self.current_step.key == "markers":
+            self._sync_marker_group_controls()
         return group_number
 
     def new_group(self) -> None:
         groups = self._active_group_store()
         if groups is not None:
+            if self.current_step.key == "markers" and len(groups) >= 99:
+                messagebox.showwarning("新增器材组", "最多可设置 99 组器材。")
+                return
             groups.append([])
+            if self.current_step.key == "markers":
+                self.marker_equipment_types.append(DEFAULT_EQUIPMENT_TYPE)
             self.current_group.set(len(groups))
+            if self.current_step.key == "markers":
+                self._sync_marker_group_controls()
+        self._refresh_step_list()
         self._redraw()
 
     def undo(self) -> None:
@@ -1382,6 +1730,12 @@ class AnnotationClient(tk.Tk):
                 removed = self.keypoints.pop()
                 self.status.set(f"已撤销关键点 {removed.vertex_index}")
                 self._refresh_keypoint_progress()
+        elif key == "field_boundary":
+            edge_points = self.boundary_edges[self.boundary_edge_var.get()]
+            if edge_points:
+                edge_points.pop()
+                self.boundary_preview_lines = False
+                self._refresh_boundary_status()
         elif key == "train_area":
             if self.train_area_points:
                 self.train_area_points.pop()
@@ -1401,6 +1755,14 @@ class AnnotationClient(tk.Tk):
                 return
             self.keypoints.clear()
             self._refresh_keypoint_progress()
+        elif key == "field_boundary":
+            if any(self.boundary_edges.values()) and not messagebox.askyesno(
+                "清空", "确定清空内存中的四条边线？已保存文件不会删除。"
+            ):
+                return
+            self.boundary_edges = {name: [] for name in BOUNDARY_KEYS}
+            self.boundary_preview_lines = False
+            self._refresh_boundary_status()
         elif key == "train_area":
             self.train_area_points.clear()
             self.train_area_region = []
@@ -1419,6 +1781,14 @@ class AnnotationClient(tk.Tk):
     # ------------------------------------------------------------------
 
     def _video_points_to_pitch(self, points: List[Point]) -> np.ndarray:
+        boundary_path = self._step_save_path("field_boundary")
+        if any(self.boundary_edges.values()) or boundary_path.exists():
+            boundary = self._build_boundary_data()
+            if boundary["enabled"]:
+                H, _quad = compute_boundary_homography(boundary)
+                return cv2.perspectiveTransform(
+                    np.asarray(points, dtype=np.float32).reshape(-1, 1, 2), H,
+                ).reshape(-1, 2)
         if len(self.keypoints) < 4:
             raise ValueError("需要先完成至少 4 个球场关键点标注")
         from tools.transform import compute_transform_matrix, video_pixel_to_pitch
@@ -1501,7 +1871,25 @@ class AnnotationClient(tk.Tk):
     # 保存
     # ------------------------------------------------------------------
 
+    def _require_applied_pitch_config(self) -> bool:
+        if self.selected_pitch_config.get() == self.pitch_config.__class__.__name__:
+            return True
+        messagebox.showwarning("场地配置未应用", "请先点击「应用并保存配置」，再保存标注或运行测量。")
+        return False
+
+    def _confirm_replacing_mismatched_keypoints(self, path: Path) -> bool:
+        if not self._keypoint_geometry_warning or not path.exists():
+            return True
+        return messagebox.askyesno(
+            "确认覆盖旧关键点",
+            f"{self._keypoint_geometry_warning}\n\n旧文件目前仍保留：\n{path}\n\n"
+            "仅在您已按当前场地配置重新标注关键点、并确认不再需要旧关键点时，"
+            "才选择“是”覆盖。否则请选择“否”，或更换相机名称保存新标注。",
+        )
+
     def save_current_step(self) -> None:
+        if not self._require_applied_pitch_config():
+            return
         key = self.current_step.key
         path = self._step_save_path(key)
         if path is None:
@@ -1511,12 +1899,38 @@ class AnnotationClient(tk.Tk):
         except ValueError as exc:
             messagebox.showwarning("保存", str(exc))
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        if key == "keypoints" and not self._confirm_replacing_mismatched_keypoints(path):
+            return
+        try:
+            _save_annotation_file(
+                path, data,
+                self._derived_cache_paths() if key in ("keypoints", "manual_h", "manual_v")
+                else (self._store_dir() / "camera_info.json",) if key == "field_boundary"
+                else (),
+            )
+        except OSError as exc:
+            messagebox.showwarning("保存", f"保存 {path.name} 失败：{exc}")
+            return
+        if key == "markers":
+            self._write_config_yaml()
+        if key == "keypoints":
+            self._keypoint_geometry_warning = None
+        if key == "field_boundary":
+            self.boundary_source_name = str(data.get("source") or "")
+            self._refresh_boundary_status()
         self.status.set(f"已保存 {path}")
         self._refresh_step_list()
-        if key in ("keypoints", "manual_h", "manual_v"):
-            self._maybe_invalidate_derived_cache()
+        if key == "markers":
+            self._warn_unsaved_marker_groups()
+
+    def _warn_unsaved_marker_groups(self) -> None:
+        empty_numbers = [str(index + 1) for index, group in enumerate(self.marker_groups) if not group]
+        if empty_numbers:
+            messagebox.showwarning(
+                "器材分组尚未完成",
+                "第 " + "、".join(empty_numbers) + " 组尚未标点，未保存。"
+                "请切换到这些组，在画面中标注后再次保存。",
+            )
 
     def _build_step_data(self, key: str) -> Dict[str, Any]:
         if key == "keypoints":
@@ -1527,8 +1941,12 @@ class AnnotationClient(tk.Tk):
             return self._build_groups_data(self.manual_h_groups, "manual_horizontal", min_points=2)
         if key == "manual_v":
             return self._build_groups_data(self.manual_v_groups, "manual_vertical", min_points=2)
+        if key == "field_boundary":
+            return self._build_boundary_data()
         if key == "markers":
-            return self._build_groups_data(self.marker_groups, "markers", min_points=1)
+            data, _empty_group_numbers = build_marker_data(
+                self.marker_groups, self.marker_equipment_types)
+            return data
         if key == "train_area":
             if len(self.train_area_region) < 3:
                 raise ValueError("请先在「区域构成」中生成至少 3 个点的区域，再保存。")
@@ -1577,54 +1995,73 @@ class AnnotationClient(tk.Tk):
         return {"source": source, "type": "marker_annotation", "groups": groups}
 
     def save_all_default(self) -> bool:
+        if not self._require_applied_pitch_config():
+            return False
+        boundary_path = self._step_save_path("field_boundary")
+        if any(self.boundary_edges.values()) or boundary_path.exists():
+            try:
+                self._build_boundary_data()
+            except ValueError as exc:
+                messagebox.showwarning(
+                    "四条边线未保存",
+                    f"{exc}\n\n请完成四边标定，或关闭四边标定后再保存。",
+                )
+                self._select_step(STEP_KEYS.index("field_boundary"))
+                return False
         self._write_config_yaml()
         saved, skipped = [], []
-        for key in ("keypoints", "manual_h", "manual_v", "train_area", "markers"):
+        for key in ("keypoints", "manual_h", "manual_v", "field_boundary",
+                    "train_area", "markers"):
             path = self._step_save_path(key)
             try:
                 data = self._build_step_data(key)
-            except ValueError:
+            except ValueError as exc:
+                if key == "field_boundary" and (any(self.boundary_edges.values()) or path.exists()):
+                    messagebox.showwarning(
+                        "四条边线未保存",
+                        f"{exc}\n\n已有边线文件未被更改；请完成并保存，或关闭四边标定后再运行。",
+                    )
+                    self._select_step(STEP_KEYS.index("field_boundary"))
+                    return False
                 skipped.append(key)
                 continue
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            if key == "keypoints" and not self._confirm_replacing_mismatched_keypoints(path):
+                return False
+            try:
+                _save_annotation_file(
+                    path, data,
+                    self._derived_cache_paths() if key in ("keypoints", "manual_h", "manual_v")
+                    else (self._store_dir() / "camera_info.json",) if key == "field_boundary"
+                    else (),
+                )
+            except OSError as exc:
+                messagebox.showwarning("保存", f"保存 {path.name} 失败：{exc}")
+                return False
+            if key == "keypoints":
+                self._keypoint_geometry_warning = None
+            if key == "field_boundary":
+                self.boundary_source_name = str(data.get("source") or "")
             saved.append(path.name)
         self._refresh_step_list()
         if saved:
             self.status.set("已保存：" + "、".join(saved))
         if skipped:
             names = {"keypoints": "关键点", "manual_h": "横线", "manual_v": "纵线",
+                     "field_boundary": "四条边线",
                      "train_area": "训练区域", "markers": "标志物"}
             self.status.set(self.status.get() + "；跳过：" + "、".join(names[k] for k in skipped))
+        if "markers.json" in saved:
+            self._warn_unsaved_marker_groups()
         return bool(saved)
 
-    def _maybe_invalidate_derived_cache(self) -> None:
-        derived = [
+    def _derived_cache_paths(self) -> Tuple[Path, ...]:
+        return (
             self._store_dir() / "distortion_params.json",
             self._store_dir() / "camera_info.json",
-        ]
-        existing = [p for p in derived if p.exists()]
-        if not existing:
-            return
-        names = "\n".join(f"  - {p.name}" for p in existing)
-        if messagebox.askyesno(
-            "派生缓存已过期",
-            "关键点/直线标注已更新，以下缓存基于旧标注计算：\n"
-            f"{names}\n\n是否删除，让主流程重新计算？（推荐）",
-        ):
-            for p in existing:
-                try:
-                    p.unlink()
-                except OSError as exc:
-                    messagebox.showwarning("清理缓存", f"删除 {p.name} 失败：{exc}")
-            self._refresh_step_list()
-            self.status.set("已清理派生缓存，主流程将重新计算畸变参数。")
+        )
 
     def clear_derived_cache(self) -> None:
-        derived = [
-            self._store_dir() / "distortion_params.json",
-            self._store_dir() / "camera_info.json",
-        ]
+        derived = self._derived_cache_paths()
         existing = [p for p in derived if p.exists()]
         if not existing:
             messagebox.showinfo("清理派生缓存", "没有需要清理的派生缓存。")
@@ -1677,6 +2114,29 @@ class AnnotationClient(tk.Tk):
                 color = self._hex_to_bgr(self.POINT_COLORS[i % len(self.POINT_COLORS)])
                 label = labels[ann.vertex_index] if ann.vertex_index < len(labels) else str(ann.vertex_index)
                 self._draw_cv_point(preview, ann.img_coord, label, color)
+        elif key == "field_boundary":
+            for name in BOUNDARY_KEYS:
+                points = self.boundary_edges[name]
+                color = self._hex_to_bgr(BOUNDARY_COLORS[name])
+                self._draw_cv_group(preview, points, name[:1].upper(), color)
+            try:
+                matrix, quad = compute_boundary_homography(
+                    {**self._build_boundary_data(), "enabled": True})
+                outline = np.round(np.asarray(quad)).astype(np.int32).reshape((-1, 1, 2))
+                cv2.polylines(preview, [outline], True, (255, 255, 255), 2)
+                inverse = np.linalg.inv(matrix)
+                vertices = np.asarray(self.pitch_config.vertices, dtype=np.float32)
+                projected = cv2.perspectiveTransform(
+                    vertices.reshape(-1, 1, 2), inverse,
+                ).reshape(-1, 2)
+                if np.isfinite(projected).all():
+                    for start, end in getattr(self.pitch_config, "edges", []):
+                        if 1 <= start <= len(projected) and 1 <= end <= len(projected):
+                            p0 = tuple(map(int, np.round(projected[start - 1])))
+                            p1 = tuple(map(int, np.round(projected[end - 1])))
+                            cv2.line(preview, p0, p1, (0, 215, 255), 2)
+            except ValueError:
+                pass
         elif key == "train_area":
             self._draw_cv_group(preview, self.train_area_points, "V", self._hex_to_bgr(self.POINT_COLORS[4]))
         else:
@@ -1745,6 +2205,43 @@ class AnnotationClient(tk.Tk):
                 label = labels[ann.vertex_index] if ann.vertex_index < len(labels) else str(ann.vertex_index)
                 self._draw_point(x, y, label, self.POINT_COLORS[i % len(self.POINT_COLORS)])
             return
+        if key == "field_boundary":
+            for name in BOUNDARY_KEYS:
+                points = self.boundary_edges[name]
+                color = BOUNDARY_COLORS[name]
+                if len(points) == 2:
+                    p0 = self.image_to_canvas(*points[0])
+                    p1 = self.image_to_canvas(*points[1])
+                    options = {"dash": (7, 4)} if self.boundary_estimated_vars[name].get() else {}
+                    self.canvas.create_line(*p0, *p1, fill=color, width=3, **options)
+                for index, point in enumerate(points):
+                    x, y = self.image_to_canvas(*point)
+                    self._draw_point(x, y, f"{name[:1].upper()}{index + 1}", color)
+            try:
+                matrix, quad = compute_boundary_homography(
+                    {**self._build_boundary_data(), "enabled": True})
+                canvas_points = [self.image_to_canvas(*point) for point in quad]
+                self.canvas.create_polygon(
+                    *[coordinate for point in canvas_points for coordinate in point],
+                    fill="", outline="white", width=2, dash=(6, 4),
+                )
+                if self.boundary_preview_lines:
+                    inverse = np.linalg.inv(matrix)
+                    vertices = np.asarray(self.pitch_config.vertices, dtype=np.float32)
+                    projected = cv2.perspectiveTransform(
+                        vertices.reshape(-1, 1, 2), inverse,
+                    ).reshape(-1, 2)
+                    if np.isfinite(projected).all():
+                        for start, end in getattr(self.pitch_config, "edges", []):
+                            if 1 <= start <= len(projected) and 1 <= end <= len(projected):
+                                p0 = self.image_to_canvas(*projected[start - 1])
+                                p1 = self.image_to_canvas(*projected[end - 1])
+                                self.canvas.create_line(
+                                    *p0, *p1, fill="#facc15", width=2, dash=(5, 5),
+                                )
+            except ValueError:
+                pass
+            return
         if key == "train_area":
             self._draw_canvas_group(self.train_area_points, "V", self.POINT_COLORS[4])
             return
@@ -1787,6 +2284,15 @@ class AnnotationClient(tk.Tk):
                 label = labels[ann.vertex_index] if ann.vertex_index < len(labels) else str(ann.vertex_index)
                 self.annotation_list.insert(tk.END, f"{ann.vertex_index}: {label} -> {ann.img_coord}")
             return
+        if key == "field_boundary":
+            for name in BOUNDARY_KEYS:
+                points = self.boundary_edges[name]
+                estimated = " · 推定" if self.boundary_estimated_vars[name].get() else ""
+                self.annotation_list.insert(
+                    tk.END, f"{BOUNDARY_LABELS[name]}：{len(points)}/2{estimated}")
+                for index, point in enumerate(points):
+                    self.annotation_list.insert(tk.END, f"  点 {index + 1}: {point}")
+            return
         if key == "train_area":
             self.annotation_list.insert(tk.END, f"视频自定义点：{len(self.train_area_points)} 个")
             for point_idx, point in enumerate(self.train_area_points):
@@ -1797,7 +2303,11 @@ class AnnotationClient(tk.Tk):
             groups = self._active_group_store() or []
             prefix = {"markers": "G", "manual_h": "H", "manual_v": "V"}.get(key, "G")
             for group_idx, group in enumerate(groups):
-                self.annotation_list.insert(tk.END, f"第 {group_idx + 1} 组: {len(group)} 个点")
+                type_label = (f" · {self.marker_equipment_types[group_idx]}"
+                              if key == "markers" and group_idx < len(self.marker_equipment_types)
+                              else "")
+                self.annotation_list.insert(
+                    tk.END, f"第 {group_idx + 1} 组{type_label}: {len(group)} 个点")
                 for point_idx, point in enumerate(group):
                     self.annotation_list.insert(tk.END, f"  {prefix}{group_idx + 1}-{point_idx + 1}: {point}")
 
@@ -1918,15 +2428,31 @@ class AnnotationClient(tk.Tk):
         open_path_in_file_manager(str(target))
 
     def save_and_run_measurement(self) -> None:
-        if not self._step_complete("keypoints"):
+        boundary_path = self._step_save_path("field_boundary")
+        boundary_mode = False
+        if any(self.boundary_edges.values()) or boundary_path.exists():
+            try:
+                boundary_mode = bool(self._build_boundary_data()["enabled"])
+            except ValueError as exc:
+                messagebox.showwarning("运行测量", f"四条边线标定尚未完成：{exc}")
+                self._select_step(STEP_KEYS.index("field_boundary"))
+                return
+        if not boundary_mode and not self._step_complete("keypoints"):
             messagebox.showwarning("运行测量", "关键点未完成（至少 4 个），无法计算单应矩阵。")
             self._select_step(STEP_KEYS.index("keypoints"))
             return
-        if not self._step_complete("markers"):
-            messagebox.showwarning("运行测量", "还没有标注任何标志物，无法测量。")
+        empty_numbers = [str(index + 1) for index, group in enumerate(self.marker_groups) if not group]
+        if empty_numbers:
+            messagebox.showwarning(
+                "运行测量",
+                "第 " + "、".join(empty_numbers) + " 组器材尚未标点。"
+                "请先完成全部器材组标注，再运行测量。",
+            )
             self._select_step(STEP_KEYS.index("markers"))
+            self.current_group.set(int(empty_numbers[0]))
+            self.select_marker_group()
             return
-        if not (self._step_complete("manual_h") and self._step_complete("manual_v")):
+        if not boundary_mode and not (self._step_complete("manual_h") and self._step_complete("manual_v")):
             if not messagebox.askyesno(
                 "运行测量",
                 "横向/纵向直线未标注完整，畸变标定精度会受影响。\n仍要继续吗？",

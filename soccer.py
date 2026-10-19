@@ -612,6 +612,7 @@ class HalfGaoWuConfiguration(HalfPitchConfiguration):
         HalfPitchConfiguration().colors + ["#00FF00"] * 14
     ))
 
+
 @dataclass
 class EliteU12Configuration(GaoWuConfiguration):
     """精英队 U12 全场配置（95m × 60m）。"""

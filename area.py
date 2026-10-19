@@ -562,10 +562,11 @@ def load_keypoints(json_path: str) -> Tuple[List[int], List[Tuple[int, int]]]:
     except Exception as e:
         raise ValueError(f"加载关键点数据时发生错误: {e}")
 
-def load_marker_keypoints(json_path: str) -> Dict[str, List[List[Tuple[int, int]]]]:
+def load_marker_keypoints(json_path: str) -> Dict[str, Any]:
     """
     从JSON文件中加载标志物关键点
-    返回格式: {'groups': [[(x,y),...], [(x,y),...], ...]}
+    返回格式: {'groups': [[(x,y),...], ...], 'equipment_types': [str, ...]}
+    旧版 markers.json 不含器材类型时，按“未指定”处理。
     """
     json_path = Path(json_path)
     if not json_path.exists():
@@ -575,6 +576,7 @@ def load_marker_keypoints(json_path: str) -> Dict[str, List[List[Tuple[int, int]
         data = json.load(f)
     
     groups_list = []
+    equipment_types = []
     # 按照 group_id 排序以确保顺序一致
     sorted_groups = sorted(data.get('groups', []), key=lambda x: x.get('group_id', 0))
     
@@ -587,8 +589,9 @@ def load_marker_keypoints(json_path: str) -> Dict[str, List[List[Tuple[int, int]
             if 'img_coord' in point:
                 points.append(tuple(point['img_coord']))
         groups_list.append(points)
+        equipment_types.append(str(group.get('equipment_type') or '未指定').strip() or '未指定')
             
-    return {'groups': groups_list}
+    return {'groups': groups_list, 'equipment_types': equipment_types}
 
 def run_annotation(frame: np.ndarray, 
                    pitch_config: Any, 

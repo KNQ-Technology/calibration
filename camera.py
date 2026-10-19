@@ -3,6 +3,8 @@ import cv2
 import sys
 import warnings
 import json
+import hashlib
+import tempfile
 from dataclasses import dataclass, field
 from typing import Tuple, Generator, Optional, Literal, List
 from pathlib import Path
@@ -43,9 +45,18 @@ from tools.pitch_annotation_tool import draw_pitch
 from area import load_keypoints, run_annotation, imwritex
 from tools import transform
 from tools.transform import compute_transform_matrix
+from field_boundary import (
+    compute_boundary_homography,
+    load_boundary,
+)
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# 增加或修改畸变约束算法时必须递增此版本，避免沿用旧算法生成的缓存。
+DISTORTION_CACHE_VERSION = 2
+DISTORTION_CACHE_CONTEXT_KEY = "_calibration_cache_context"
+MAX_ANNOTATION_HASH_BYTES = 10 * 1024 * 1024
 
 
 # ==========================================
@@ -836,9 +847,47 @@ class Camera:
             raise ValueError(f"视频为空: {self.video_path}")
             
         self.frame_shape = self.first_frame.shape[:2] # (h, w)
-        
-        # 2. 标定并计算坐标变换
-        if self.enable_distortion_correction:
+        self.field_boundary_path = self._find_calibration_file("field_boundary.json")
+        self.field_boundary_data = None
+        self.field_boundary_quad = None
+        if self.field_boundary_path is not None:
+            try:
+                loaded_boundary = load_boundary(
+                    self.field_boundary_path,
+                    self.name,
+                    self.config,
+                    (self.frame_shape[1], self.frame_shape[0]),
+                )
+                if loaded_boundary is not None and loaded_boundary["enabled"]:
+                    self.field_boundary_data = loaded_boundary
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                raise ValueError(
+                    f"[Camera {self.id}] 四条边线标定无效：{self.field_boundary_path}: {exc}。"
+                    "请重新标定或移走该文件；不会静默使用旧模式。"
+                ) from exc
+
+        # 2. 标定并计算坐标变换。四边模式独立于旧关键点/直线标注，
+        # 不运行旧标定，也不把旧畸变参数套在原图上求得的四边矩阵上。
+        if self.field_boundary_data is not None:
+            try:
+                self.homography_matrix, self.field_boundary_quad = (
+                    compute_boundary_homography(self.field_boundary_data)
+                )
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"[Camera {self.id}] 四条边线标定计算失败：{exc}。"
+                    "请调整四条边线，不会回退到旧映射。"
+                ) from exc
+            self.enable_distortion_correction = False
+            print(f"[Camera {self.id}] 已优先使用四条边线标定：{self.field_boundary_path}")
+            print(f"[Camera {self.id}] 四边测试模式直接使用原图坐标，不依赖旧关键点和畸变缓存")
+            source_name = self.field_boundary_data.get("source")
+            if source_name and Path(str(source_name)).name != Path(str(self.video_path)).name:
+                print(
+                    f"[Camera {self.id}] ⚠️ 边线取自 {source_name}，当前视频为 "
+                    f"{Path(str(self.video_path)).name}；请确认同一固定机位且构图未变"
+                )
+        elif self.enable_distortion_correction:
             self.homography_matrix = self._calibrate_with_distortion()
         else:
             self.homography_matrix = self._calibrate()
@@ -1718,6 +1767,11 @@ class Camera:
             'angle_span': float(self.info.angle_span),
             'max_effective_dist': float(self.info.max_effective_dist),
             'distortion_correction_enabled': self.enable_distortion_correction,
+            'field_calibration_mode': 'four_edges' if self.field_boundary_data is not None else 'legacy',
+            'field_boundary_file': str(self.field_boundary_path)
+            if self.field_boundary_data is not None else None,
+            'field_boundary_quad': self.field_boundary_quad.tolist()
+            if self.field_boundary_quad is not None else None,
             'visible_grid_cells': self.info.visible_grid_cells.tolist() if self.info.visible_grid_cells is not None else None,
             'grid_size': float(self.info.grid_size) if self.info.grid_size is not None else None,
             'num_visible_grids': len(self.info.visible_grid_cells) if self.info.visible_grid_cells is not None else 0
@@ -1802,6 +1856,119 @@ class Camera:
                 paths[key] = self.store_dir / filename
         
         return paths
+
+    def _validate_keypoints_pitch(self, path: Path) -> None:
+        """避免相机目录复用旧场地预设时把相同点号解释为另一处场地位置。"""
+        with path.open("r", encoding="utf-8") as stream:
+            data = json.load(stream)
+        expected_type = type(self.config).__name__
+        saved_type = data.get("config_type")
+        if saved_type and saved_type != expected_type:
+            reason = f"场地预设为 {saved_type}，当前为 {expected_type}"
+        else:
+            reason = None
+
+        vertices = self.config.vertices
+        annotations = data.get("annotations", [])
+        if not isinstance(annotations, list):
+            reason = reason or "annotations 格式错误"
+            annotations = []
+        for item in annotations:
+            try:
+                index = int(item["vertex_index"])
+                world = item["world_coord"]
+                if not 0 <= index < len(vertices) or len(world) != 2:
+                    raise ValueError("点号或坐标格式错误")
+                if any(abs(float(world[axis]) - float(vertices[index][axis])) > 1.0
+                       for axis in (0, 1)):
+                    raise ValueError(f"点号 {index} 的场地坐标已变化")
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                reason = reason or str(exc)
+                break
+        if not saved_type and not annotations:
+            reason = reason or "缺少场地类型和关键点坐标，无法验证"
+        if reason:
+            raise ValueError(
+                f"[Camera {self.id}] 关键点文件与当前场地配置不匹配（{reason}）。"
+                f"请在标注客户端核对并重新保存关键点；原文件未修改: {path}"
+            )
+
+    @staticmethod
+    def _annotation_fingerprint(path: Path) -> Optional[dict]:
+        """对小型标注 JSON 取内容指纹；不存在的可选标注用 None 表示。"""
+        try:
+            if not path.exists():
+                return None
+            size = path.stat().st_size
+            if size > MAX_ANNOTATION_HASH_BYTES:
+                raise ValueError(f"标注文件过大，拒绝当作缓存输入: {path} ({size} bytes)")
+            with path.open("rb") as stream:
+                digest = hashlib.sha256(stream.read()).hexdigest()
+            return {"size": size, "sha256": digest}
+        except OSError as exc:
+            raise OSError(f"无法读取标注文件，不能安全复用畸变缓存: {path}") from exc
+
+    def _distortion_cache_context(self, paths: dict) -> dict:
+        """记录决定畸变结果的场地、视频帧和标注输入。"""
+        from distort import IDX
+
+        pitch_geometry = {
+            "type": f"{type(self.config).__module__}.{type(self.config).__qualname__}",
+            "length": float(self.config.length),
+            "width": float(self.config.width),
+            "vertices": [[float(x), float(y)] for x, y in self.config.vertices],
+            "labels": list(self.config.labels),
+            "edges": [[int(start), int(end)] for start, end in self.config.edges],
+        }
+        geometry_bytes = json.dumps(
+            pitch_geometry, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        video_path = Path(self.video_path).resolve()
+        try:
+            video_stat = video_path.stat()
+            video_identity = {
+                "path": str(video_path),
+                "size": video_stat.st_size,
+                "mtime_ns": video_stat.st_mtime_ns,
+                "frame_sha256": hashlib.sha256(self.first_frame.tobytes()).hexdigest(),
+            }
+        except OSError:
+            # VideoCapture 也可读取流地址；流没有文件 stat，用已解码的标定帧识别。
+            video_identity = {
+                "source": str(self.video_path),
+                "frame_sha256": hashlib.sha256(self.first_frame.tobytes()).hexdigest(),
+            }
+        return {
+            "algorithm_version": DISTORTION_CACHE_VERSION,
+            "pitch_geometry_sha256": hashlib.sha256(geometry_bytes).hexdigest(),
+            "pitch_type": pitch_geometry["type"],
+            "pitch_length": pitch_geometry["length"],
+            "pitch_width": pitch_geometry["width"],
+            "frame_shape": [int(value) for value in self.frame_shape],
+            "frame_index": int(IDX),
+            "video": video_identity,
+            "annotations": {
+                key: self._annotation_fingerprint(paths[key])
+                for key in ("keypoints", "manual_h", "manual_v")
+            },
+        }
+
+    @staticmethod
+    def _save_distortion_cache_atomic(params, info: dict, path: Path) -> None:
+        """新结果完整写入后才替换旧缓存；重算失败时保留原文件。"""
+        from de_distortion import save_distortion_params
+
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        os.close(file_descriptor)
+        temporary_path = Path(temporary_name)
+        try:
+            save_distortion_params(params, info, str(temporary_path))
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
     
     def _calibrate(self):
         """
@@ -1823,6 +1990,7 @@ class Camera:
         # 尝试加载现有标定数据
         if json_path.exists():
             print(f"[Camera {self.id}] 发现已有标定文件: {json_path}")
+            self._validate_keypoints_pitch(json_path)
             try:
                 indices, points = load_keypoints(str(json_path))
                 print(f"[Camera {self.id}] 加载成功。")
@@ -1875,7 +2043,6 @@ class Camera:
         from de_distortion import (
             calibrate_distortion, 
             undistort_points,
-            save_distortion_params,
             load_distortion_params
         )
         
@@ -1890,6 +2057,7 @@ class Camera:
         
         if paths['keypoints'].exists():
             print(f"[Camera {self.id}] 发现已有标定文件: {paths['keypoints']}")
+            self._validate_keypoints_pitch(paths['keypoints'])
             try:
                 indices, points = load_keypoints(str(paths['keypoints']))
                 print(f"[Camera {self.id}] 加载成功。")
@@ -1912,14 +2080,19 @@ class Camera:
         
         # 2. 畸变校正
         print(f"\n[Camera {self.id}] 步骤 2/3: 畸变参数标定")
+        cache_context = self._distortion_cache_context(paths)
         
         if not self.debug_mode and paths['distortion'].exists():
             print(f"[Camera {self.id}] 发现已有畸变参数: {paths['distortion']}")
             try:
-                self.distortion_params, self.distortion_info = load_distortion_params(
+                cached_params, cached_info = load_distortion_params(
                     str(paths['distortion'])
                 )
-                print(f"[Camera {self.id}] 畸变参数加载成功。")
+                if cached_info.get(DISTORTION_CACHE_CONTEXT_KEY) == cache_context:
+                    self.distortion_params, self.distortion_info = cached_params, cached_info
+                    print(f"[Camera {self.id}] 畸变参数缓存与当前标注及算法一致，加载成功。")
+                else:
+                    print(f"[Camera {self.id}] 畸变参数缓存为旧版或输入已变化，将重新计算；旧文件在计算成功前保留。")
             except Exception as e:
                 print(f"[Camera {self.id}] 加载失败: {e}，将重新标定。")
                 self.distortion_params = None
@@ -1937,11 +2110,11 @@ class Camera:
                 pitch_config=self.config,  # 传入当前相机的球场配置
                 auto_annotate=True
             )
-            # 保存畸变参数（调试模式下也保存，方便后续使用）
-            save_distortion_params(
-                self.distortion_params, 
-                self.distortion_info, 
-                str(paths['distortion'])
+            # 标注可能在本次标定过程中生成，因此保存时重新计算输入指纹。
+            self.distortion_info = dict(self.distortion_info)
+            self.distortion_info[DISTORTION_CACHE_CONTEXT_KEY] = self._distortion_cache_context(paths)
+            self._save_distortion_cache_atomic(
+                self.distortion_params, self.distortion_info, paths['distortion']
             )
         
         # 3. 去畸变后计算单应矩阵
@@ -2693,7 +2866,8 @@ class CameraDetection:
         # 3. 转换到球场坐标（自动选择单应性矩阵或TPS）
         self.pitch_positions = self.camera.pixel_to_pitch(foot_positions_pixel)
         
-        # 4. 过滤检测（只保留场地范围内的点）
+        # 4. 两种模式均在场地坐标中按当前 H 对应的边界判断。
+        # 四边模式的 H 已由人工标定确定；这样筛选与坐标投影保持一致。
         _, self.mask = self.camera.filter_points_in_coverage(self.pitch_positions)
         
         return self.pitch_positions, self.mask
@@ -3266,11 +3440,7 @@ class TrainArea:
         print("  - 白色点/数字: 球场固定关键点 (序号 1, 2, 3...)")
         print("  - 红色点/V数字: 从视频画面标定的点 (序号 V1, V2...)")
 
-        try:
-            sv.plot_image(pitch_img)
-        except NameError:
-            cv2.imshow("训练区域选择 - 球场俯视图", pitch_img)
-            cv2.waitKey(1)
+        sv.plot_image(pitch_img)  # 使用 supervision 显示，或 cv2.imshow
 
         # 4. 接收用户输入
         print("\n请输入构成训练区域的点序号，按顺序输入，用逗号或空格分隔。")

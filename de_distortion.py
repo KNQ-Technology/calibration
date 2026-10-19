@@ -372,8 +372,8 @@ class DistortionLoss:
             constraints = [
                 ("H_自动_上边线", "V_自动_左底线", "01"),
                 ("V_自动_左底线", "H_自动_下边线", "06"),
-                ("H_自动_下边线", "V_自动_右中线", "17"),
-                ("V_自动_右中线", "H_自动_上边线", "14")
+                ("H_自动_下边线", "V_自动_中线", "17"),
+                ("V_自动_中线", "H_自动_上边线", "14")
             ]
             
             for k1, k2, pid in constraints:
@@ -548,8 +548,8 @@ class DistortionLoss:
             constraints = [
                 ("H_自动_上边线", "V_自动_左底线", "01"),
                 ("V_自动_左底线", "H_自动_下边线", "06"),
-                ("H_自动_下边线", "V_自动_右中线", "17"),
-                ("V_自动_右中线", "H_自动_上边线", "14")
+                ("H_自动_下边线", "V_自动_中线", "17"),
+                ("V_自动_中线", "H_自动_上边线", "14")
             ]
             for k1, k2, pid in constraints:
                 l1 = next((v for k, v in ud_lines.items() if k1 in k), None)
@@ -697,19 +697,40 @@ class DistortionLoss:
 # ==========================================
 # 数据加载
 # ==========================================
-def get_auto_edge_groups(keypoints_dict):
-    """自动提取场地边缘线"""
-    groups, names = [], []
+def get_auto_edge_groups(keypoints_dict, pitch_config):
+    """按当前场地的世界坐标提取共线的已标注边线点。
+
+    关键点下标因全场、半场及新增草皮分界点而异，不能用固定下标
+    推断直线。全场的中线位于 length/2，半场的中线位于 length。
+    """
+    vertices = pitch_config.vertices
+    length = float(pitch_config.length)
+    width = float(pitch_config.width)
+
+    def on_coordinate(axis, value):
+        return [
+            idx for idx, vertex in enumerate(vertices)
+            if idx in keypoints_dict
+            and np.isclose(vertex[axis], value, rtol=0, atol=1e-6)
+        ]
+
+    # 依据配置本身判断全场/半场，不能因局部漏标而把全场端线误当中线。
+    full_pitch_midline = sum(
+        np.isclose(vertex[0], length / 2, rtol=0, atol=1e-6)
+        for vertex in vertices
+    ) >= 3
+    middle_x = length / 2 if full_pitch_midline else length
     definitions = [
-        ("H_自动_上边线", [0] + [22 + 2*i for i in range(7)] + [13]),
-        ("H_自动_下边线", [5] + [23 + 2*i for i in range(7)] + [16]),
-        ("V_自动_左底线", [0, 1, 2, 3, 4, 5]),
-        ("V_自动_右中线", [13, 14, 18, 15, 16])
+        ("H_自动_上边线", on_coordinate(1, 0), 0),
+        ("H_自动_下边线", on_coordinate(1, width), 0),
+        ("V_自动_左底线", on_coordinate(0, 0), 1),
+        ("V_自动_中线", on_coordinate(0, middle_x), 1),
     ]
-    for name, indices in definitions:
-        current = [keypoints_dict[idx] for idx in indices if idx in keypoints_dict]
-        if len(current) >= 3:
-            groups.append(current)
+    groups, names = [], []
+    for name, indices, sort_axis in definitions:
+        indices.sort(key=lambda idx: (vertices[idx][sort_axis], idx))
+        if len(indices) >= 3:
+            groups.append([keypoints_dict[idx] for idx in indices])
             names.append(name)
     return groups, names
 
@@ -799,7 +820,7 @@ def calibrate_distortion(
     all_groups, all_names = [], []
     
     # 自动边缘线
-    ag, an = get_auto_edge_groups(kpts_dict)
+    ag, an = get_auto_edge_groups(kpts_dict, pitch_config)
     all_groups.extend(ag)
     all_names.extend(an)
     
