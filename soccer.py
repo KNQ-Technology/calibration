@@ -669,6 +669,16 @@ class HalfEliteU15Configuration(HalfGaoWuConfiguration):
 
 
 @dataclass
+class PuGongYingU11Configuration(EliteU12Configuration):
+    """蒲公英 U11 全场配置，与精英队 U12 共用场地参数。"""
+
+
+@dataclass
+class HalfPuGongYingU11Configuration(HalfEliteU12Configuration):
+    """蒲公英 U11 半场配置，与精英队 U12 共用场地参数。"""
+
+
+@dataclass
 class HalfWuChuanConfiguration:
     """吴川半场配置 (33m × 44m)"""
     width: int = 4400  # [cm] 44m
