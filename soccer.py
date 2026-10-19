@@ -613,6 +613,62 @@ class HalfGaoWuConfiguration(HalfPitchConfiguration):
     ))
 
 @dataclass
+class EliteU12Configuration(GaoWuConfiguration):
+    """精英队 U12 全场配置（95m × 60m）。"""
+
+    width: int = 6000  # [cm] 场地宽 60m
+    length: int = 9500  # [cm] 场地长 95m
+    penalty_box_width: int = 4000  # [cm] 大禁区横向宽度 40m
+    penalty_box_length: int = 1700  # [cm] 大禁区向场内深度 17m
+    goal_box_width: int = 1900  # [cm] 小禁区横向宽度 19m
+    goal_box_length: int = 600  # [cm] 小禁区向场内深度 6m
+    centre_circle_radius: int = 900  # [cm] 中圈半径 9m
+    penalty_spot_distance: int = 1100  # [cm] 点球点到底线 11m
+
+
+@dataclass
+class HalfEliteU12Configuration(HalfGaoWuConfiguration):
+    """精英队 U12 半场配置（47.5m × 60m）。"""
+
+    width: int = 6000  # [cm] 场地宽 60m
+    length: int = 4750  # [cm] 半场长 47.5m
+    penalty_box_width: int = 4000  # [cm] 大禁区横向宽度 40m
+    penalty_box_length: int = 1700  # [cm] 大禁区向场内深度 17m
+    goal_box_width: int = 1900  # [cm] 小禁区横向宽度 19m
+    goal_box_length: int = 600  # [cm] 小禁区向场内深度 6m
+    centre_circle_radius: int = 900  # [cm] 中圈半径 9m
+    penalty_spot_distance: int = 1100  # [cm] 点球点到底线 11m
+
+
+@dataclass
+class EliteU15Configuration(GaoWuConfiguration):
+    """精英队 U15 全场配置（95m × 60m）。"""
+
+    width: int = 6000  # [cm] 场地宽 60m
+    length: int = 9500  # [cm] 场地长 95m
+    penalty_box_width: int = 4000  # [cm] 大禁区横向宽度 40m
+    penalty_box_length: int = 1700  # [cm] 大禁区向场内深度 17m
+    goal_box_width: int = 1900  # [cm] 小禁区横向宽度 19m
+    goal_box_length: int = 600  # [cm] 小禁区向场内深度 6m
+    centre_circle_radius: int = 900  # [cm] 中圈半径 9m
+    penalty_spot_distance: int = 1100  # [cm] 点球点到底线 11m
+
+
+@dataclass
+class HalfEliteU15Configuration(HalfGaoWuConfiguration):
+    """精英队 U15 半场配置（47.5m × 60m）。"""
+
+    width: int = 6000  # [cm] 场地宽 60m
+    length: int = 4750  # [cm] 半场长 47.5m
+    penalty_box_width: int = 4000  # [cm] 大禁区横向宽度 40m
+    penalty_box_length: int = 1700  # [cm] 大禁区向场内深度 17m
+    goal_box_width: int = 1900  # [cm] 小禁区横向宽度 19m
+    goal_box_length: int = 600  # [cm] 小禁区向场内深度 6m
+    centre_circle_radius: int = 900  # [cm] 中圈半径 9m
+    penalty_spot_distance: int = 1100  # [cm] 点球点到底线 11m
+
+
+@dataclass
 class HalfWuChuanConfiguration:
     """吴川半场配置 (33m × 44m)"""
     width: int = 4400  # [cm] 44m
