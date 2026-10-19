@@ -140,8 +140,10 @@ from marker_group_model import (
     DEFAULT_EQUIPMENT_TYPE,
     build_marker_data,
     effective_marker_group_count,
+    load_group_closed_modes,
     load_marker_groups,
     normalize_equipment_type,
+    resize_group_closed_modes,
     resize_marker_groups,
     measurement_group_source_indices,
     sync_measurement_group_configs,
@@ -337,10 +339,10 @@ STEP_DEFS: List[StepDef] = [
         "markers",
         "器材分组",
         "标注要测量的标志物（如障碍桶）。\n\n"
-        "先设置器材组数，并为当前组选择或输入器材类型。\n"
+        "先设置器材组数，并为当前组选择器材类型和训练形式。\n"
         "切换组后左键添加点；每组至少标注一个点。\n\n"
-        "组内/组间距离的计算方式由 config.yaml 中的\n"
-        "GROUP_CONFIGS / PAIR_CONFIGS 决定。",
+        "线型只测量相邻点；环型还测量末点到首点。\n"
+        "组间距离仍由 config.yaml 中的 PAIR_CONFIGS 决定。",
     ),
     StepDef(
         "finish",
@@ -409,6 +411,8 @@ class AnnotationClient(tk.Tk):
         configured_count = max(configured_indices, default=0) + 1
         self.marker_groups: List[List[Point]] = [[] for _ in range(max(1, min(99, configured_count)))]
         self.marker_equipment_types: List[str] = [DEFAULT_EQUIPMENT_TYPE] * len(self.marker_groups)
+        self.marker_group_closed: List[bool] = load_group_closed_modes(
+            self.config_data, len(self.marker_groups))
         self._config_source_indices = list(range(len(self.marker_groups)))
         self.manual_h_groups: List[List[Point]] = [[]]
         self.manual_v_groups: List[List[Point]] = [[]]
@@ -429,6 +433,8 @@ class AnnotationClient(tk.Tk):
         self.current_group = tk.IntVar(value=1)
         self.marker_group_count_var = tk.StringVar(value=str(len(self.marker_groups)))
         self.marker_equipment_type_var = tk.StringVar(value=DEFAULT_EQUIPMENT_TYPE)
+        self.marker_layout_var = tk.StringVar(
+            value="ring" if self.marker_group_closed[0] else "line")
         self._active_marker_type_index = 0
         self.selected_vertex = tk.IntVar(value=0)
 
@@ -642,6 +648,8 @@ class AnnotationClient(tk.Tk):
                         setattr(self, attr, groups)
                         if key == "markers":
                             self.marker_equipment_types = equipment_types
+                            self.marker_group_closed = resize_group_closed_modes(
+                                self.marker_group_closed, len(groups))
                             self.marker_group_count_var.set(str(len(groups)))
                         loaded.append(f"{key} {len(groups)} 组")
                 except Exception:
@@ -973,10 +981,10 @@ class AnnotationClient(tk.Tk):
 
         ttk.Button(box, text="应用并保存配置 (config.yaml)",
                    command=self.apply_setup).grid(row=11, column=0, sticky="ew")
-        ttk.Label(box, text="器材组数和器材类型请在第 7 步设置。",
+        ttk.Label(box, text="器材组数、类型和训练形式请在第 7 步设置。",
                   foreground="#475569", wraplength=280, justify="left").grid(
                       row=12, column=0, sticky="w", pady=(12, 4))
-        ttk.Button(box, text="前往第 7 步 · 设置器材组数和类型",
+        ttk.Button(box, text="前往第 7 步 · 设置器材分组",
                    command=lambda: self._select_step(STEP_KEYS.index("markers"))).grid(
                        row=13, column=0, sticky="ew")
         self._refresh_store_dir_hint()
@@ -1114,11 +1122,29 @@ class AnnotationClient(tk.Tk):
             state="normal",
         ).grid(row=5, column=0, sticky="ew", pady=(3, 8))
 
+        ttk.Label(box, text="当前组训练形式").grid(row=6, column=0, sticky="w")
+        mode_row = ttk.Frame(box)
+        mode_row.grid(row=7, column=0, sticky="ew", pady=(3, 4))
+        mode_row.columnconfigure(0, weight=1)
+        mode_row.columnconfigure(1, weight=1)
+        ttk.Radiobutton(
+            mode_row, text="线型训练", variable=self.marker_layout_var,
+            value="line", command=self._remember_marker_layout_mode,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            mode_row, text="环型训练", variable=self.marker_layout_var,
+            value="ring", command=self._remember_marker_layout_mode,
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Label(
+            box, text="环型会额外测量最后一点到第一点，建议至少标注 3 个点。",
+            foreground="#475569", wraplength=280, justify="left",
+        ).grid(row=8, column=0, sticky="w", pady=(0, 8))
+
         ttk.Button(box, text="新增一组器材", command=self.new_group).grid(
-            row=6, column=0, sticky="ew")
-        ttk.Label(box, text="每组在画面中至少标注一个点；保存后类型会写入 markers.json。",
+            row=9, column=0, sticky="ew")
+        ttk.Label(box, text="每组至少标注一个点；保存后训练形式写入 config.yaml。",
                   foreground="#475569", wraplength=280, justify="left").grid(
-                      row=7, column=0, sticky="w", pady=(8, 0))
+                      row=10, column=0, sticky="w", pady=(8, 0))
 
     def _build_train_area_panel(self, panel: ttk.Frame) -> None:
         box = ttk.LabelFrame(panel, text="区域构成", padding=8)
@@ -1282,7 +1308,7 @@ class AnnotationClient(tk.Tk):
         source_indices = measurement_group_source_indices(self.marker_groups)
         sync_measurement_group_configs(
             data, effective_marker_group_count(self.marker_groups), source_indices,
-            self._config_source_indices,
+            self._config_source_indices, self.marker_group_closed,
         )
         data.setdefault("jac", "3-point")
         data.setdefault("reprojection_eps", 5.0)
@@ -1628,6 +1654,14 @@ class AnnotationClient(tk.Tk):
                 self.marker_equipment_type_var.get())
             self._refresh_list()
 
+    def _remember_marker_layout_mode(self) -> None:
+        index = self._active_marker_type_index
+        if 0 <= index < len(self.marker_group_closed):
+            self.marker_group_closed[index] = self.marker_layout_var.get() == "ring"
+            self._refresh_list()
+            mode = "环型训练" if self.marker_group_closed[index] else "线型训练"
+            self.status.set(f"第 {index + 1} 组已设为{mode}；保存本步后生效。")
+
     def _sync_marker_group_controls(self) -> None:
         self.marker_group_count_var.set(str(len(self.marker_groups)))
         try:
@@ -1638,6 +1672,8 @@ class AnnotationClient(tk.Tk):
         self.current_group.set(group_number)
         self._active_marker_type_index = group_number - 1
         self.marker_equipment_type_var.set(self.marker_equipment_types[self._active_marker_type_index])
+        self.marker_layout_var.set(
+            "ring" if self.marker_group_closed[self._active_marker_type_index] else "line")
 
     def apply_marker_group_count(self) -> None:
         try:
@@ -1652,13 +1688,15 @@ class AnnotationClient(tk.Tk):
         old_count = len(self.marker_groups)
         if target < old_count:
             removed_groups = [
-                f"第 {index + 1} 组（{len(group)} 个点，{self.marker_equipment_types[index]}）"
+                f"第 {index + 1} 组（{len(group)} 个点，{self.marker_equipment_types[index]}，"
+                f"{'环型' if self.marker_group_closed[index] else '线型'}）"
                 for index, group in enumerate(self.marker_groups[target:], start=target)
-                if group or self.marker_equipment_types[index] != DEFAULT_EQUIPMENT_TYPE
+                if (group or self.marker_equipment_types[index] != DEFAULT_EQUIPMENT_TYPE
+                    or self.marker_group_closed[index])
             ]
             if removed_groups and not messagebox.askyesno(
                 "减少器材组数",
-                "减少组数会删除以下组的标注点或器材类型：\n"
+                "减少组数会删除以下组的标注点、器材类型或训练形式：\n"
                 + "\n".join(removed_groups) + "\n\n确定继续吗？",
             ):
                 self.marker_group_count_var.set(str(old_count))
@@ -1666,6 +1704,8 @@ class AnnotationClient(tk.Tk):
 
         self.marker_groups, self.marker_equipment_types = resize_marker_groups(
             self.marker_groups, self.marker_equipment_types, target)
+        self.marker_group_closed = resize_group_closed_modes(
+            self.marker_group_closed, target)
         try:
             selected_group = int(self.current_group.get())
         except (tk.TclError, ValueError):
@@ -1688,6 +1728,8 @@ class AnnotationClient(tk.Tk):
         if group_number > len(self.marker_groups):
             self.marker_groups, self.marker_equipment_types = resize_marker_groups(
                 self.marker_groups, self.marker_equipment_types, group_number)
+            self.marker_group_closed = resize_group_closed_modes(
+                self.marker_group_closed, group_number)
         self._sync_marker_group_controls()
         self._refresh_step_list()
         self._redraw()
@@ -1703,6 +1745,7 @@ class AnnotationClient(tk.Tk):
                 groups.append([])
                 if self.current_step.key == "markers":
                     self.marker_equipment_types.append(DEFAULT_EQUIPMENT_TYPE)
+                    self.marker_group_closed.append(False)
         self.current_group.set(group_number)
         if self.current_step.key == "markers":
             self._sync_marker_group_controls()
@@ -1717,6 +1760,7 @@ class AnnotationClient(tk.Tk):
             groups.append([])
             if self.current_step.key == "markers":
                 self.marker_equipment_types.append(DEFAULT_EQUIPMENT_TYPE)
+                self.marker_group_closed.append(False)
             self.current_group.set(len(groups))
             if self.current_step.key == "markers":
                 self._sync_marker_group_controls()
@@ -2306,8 +2350,11 @@ class AnnotationClient(tk.Tk):
                 type_label = (f" · {self.marker_equipment_types[group_idx]}"
                               if key == "markers" and group_idx < len(self.marker_equipment_types)
                               else "")
+                layout_label = (
+                    " · 环型" if self.marker_group_closed[group_idx] else " · 线型"
+                ) if key == "markers" and group_idx < len(self.marker_group_closed) else ""
                 self.annotation_list.insert(
-                    tk.END, f"第 {group_idx + 1} 组{type_label}: {len(group)} 个点")
+                    tk.END, f"第 {group_idx + 1} 组{type_label}{layout_label}: {len(group)} 个点")
                 for point_idx, point in enumerate(group):
                     self.annotation_list.insert(tk.END, f"  {prefix}{group_idx + 1}-{point_idx + 1}: {point}")
 

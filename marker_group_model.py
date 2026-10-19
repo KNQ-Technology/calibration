@@ -8,6 +8,31 @@ from typing import Any
 DEFAULT_EQUIPMENT_TYPE = "未指定"
 
 
+def load_group_closed_modes(data: dict[str, Any], count: int) -> list[bool]:
+    """Read each group's line/ring setting; older configs default to line."""
+    modes = [False] * count
+    configs = data.get("GROUP_CONFIGS")
+    if not isinstance(configs, list):
+        return modes
+    for item in configs:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("group"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < count:
+            modes[index] = bool(item.get("is_closed", False))
+    return modes
+
+
+def resize_group_closed_modes(modes: list[bool], count: int) -> list[bool]:
+    """Keep retained group settings and default new groups to line."""
+    if not 1 <= count <= 99:
+        raise ValueError("器材组数须为 1–99。")
+    return [bool(value) for value in modes[:count]] + [False] * max(0, count - len(modes))
+
+
 def normalize_equipment_type(value: Any) -> str:
     """Keep older marker files (without a type) readable."""
     return value.strip() if isinstance(value, str) and value.strip() else DEFAULT_EQUIPMENT_TYPE
@@ -83,6 +108,7 @@ def measurement_group_source_indices(groups: list[list[tuple[int, int]]]) -> lis
 def sync_measurement_group_configs(
     data: dict[str, Any], count: int, source_indices: list[int] | None = None,
     existing_source_indices: list[int] | None = None,
+    closed_modes: list[bool] | None = None,
 ) -> None:
     """Match config.yaml group indices to saved markers, preserving custom options."""
     if not 1 <= count <= 99:
@@ -91,6 +117,10 @@ def sync_measurement_group_configs(
         source_indices = list(range(count))
     if len(source_indices) != count or len(set(source_indices)) != count:
         raise ValueError("器材组映射与有效组数不一致。")
+    if closed_modes is not None and any(
+        source_index < 0 or source_index >= len(closed_modes) for source_index in source_indices
+    ):
+        raise ValueError("器材组训练形式与有效组数不一致。")
     target_index = {original: current for current, original in enumerate(source_indices)}
 
     def old_source_index(config_index: int) -> int:
@@ -112,10 +142,16 @@ def sync_measurement_group_configs(
             if index >= 0 and source_index not in existing_groups:
                 existing_groups[source_index] = dict(item)
 
-    data["GROUP_CONFIGS"] = [
-        {**existing_groups.get(source_index, {"is_closed": False}), "group": target_index[source_index]}
-        for source_index in source_indices
-    ]
+    group_configs = []
+    for source_index in source_indices:
+        group_config = {
+            **existing_groups.get(source_index, {"is_closed": False}),
+            "group": target_index[source_index],
+        }
+        if closed_modes is not None:
+            group_config["is_closed"] = bool(closed_modes[source_index])
+        group_configs.append(group_config)
+    data["GROUP_CONFIGS"] = group_configs
 
     original_pairs = data.get("PAIR_CONFIGS")
     pairs: list[dict[str, Any]] = []
