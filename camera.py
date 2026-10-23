@@ -95,26 +95,97 @@ def _clip_segment_to_pitch(start, end, pitch_length, pitch_width):
     return start + enter * delta, start + leave * delta
 
 
-def _projected_frame_edge_segments(points, pitch_length, pitch_width):
-    """Return clipped, adjacent projected samples without curve fitting.
+def _projected_frame_edge_line(points, pitch_length, pitch_width, denominators=None):
+    """Fit at most one straight, sample-supported image-edge diagnostic line.
 
-    A discontinuity spanning more than two pitch diagonals is a perspective
-    singularity, not a line to draw across the pitch.
+    Perspective horizons can split one image edge into opposing branches. Keep
+    only the longest locally straight, monotone run; never join separate runs
+    or extend the result beyond its supporting samples.
     """
     points = np.asarray(points, dtype=np.float64)
-    if points.ndim != 2 or points.shape[1] != 2:
-        return []
-    max_step = 2 * np.hypot(pitch_length, pitch_width)
-    segments = []
-    for start, end in zip(points[:-1], points[1:]):
-        if not (np.isfinite(start).all() and np.isfinite(end).all()):
-            continue
-        if not np.isfinite(end - start).all() or np.linalg.norm(end - start) > max_step:
-            continue
-        segment = _clip_segment_to_pitch(start, end, pitch_length, pitch_width)
-        if segment is not None:
-            segments.append(segment)
-    return segments
+    if (points.ndim != 2 or points.shape[1] != 2 or len(points) < 2 or
+            pitch_length <= 0 or pitch_width <= 0):
+        return None
+
+    diagonal = np.hypot(pitch_length, pitch_width)
+    margin = diagonal * 0.05
+    valid = np.isfinite(points).all(axis=1)
+    valid &= ((points[:, 0] >= -margin) & (points[:, 0] <= pitch_length + margin) &
+              (points[:, 1] >= -margin) & (points[:, 1] <= pitch_width + margin))
+    safe_points = np.where(np.isfinite(points), points, 0.0)
+    connected = np.linalg.norm(np.diff(safe_points, axis=0), axis=1) <= max(
+        diagonal * 0.2, 2 * diagonal / (len(points) - 1)
+    )
+    if denominators is not None:
+        denominators = np.asarray(denominators, dtype=np.float64)
+        if denominators.shape != (len(points),):
+            return None
+        valid &= np.isfinite(denominators) & (denominators != 0)
+        connected &= np.sign(denominators[:-1]) == np.sign(denominators[1:])
+    connected &= valid[:-1] & valid[1:]
+
+    min_support = 2 if len(points) < 5 else max(4, int(np.ceil(len(points) * 0.1)))
+    if np.count_nonzero(valid) < min_support:
+        return None
+    tolerance = diagonal * 0.015
+    reverse_tolerance = diagonal * 0.003
+    best = None
+    best_score = (-1, -1.0)
+    offsets = sorted({1, max(2, len(points) // 10), max(3, len(points) // 4)})
+    for offset in offsets:
+        for first in range(len(points) - offset):
+            last = first + offset
+            if not (valid[first] and valid[last]):
+                continue
+            direction = safe_points[last] - safe_points[first]
+            baseline = np.linalg.norm(direction)
+            if baseline < diagonal * 0.02:
+                continue
+            direction /= baseline
+            relative = safe_points - safe_points[first]
+            distances = np.abs(relative[:, 0] * direction[1] -
+                               relative[:, 1] * direction[0])
+            inliers = valid & (distances <= tolerance)
+            axial = relative @ direction
+
+            start = 0
+            while start < len(points):
+                if not inliers[start]:
+                    start += 1
+                    continue
+                end = start + 1
+                travel_sign = 0
+                reversed_at = False
+                while end < len(points) and inliers[end] and connected[end - 1]:
+                    travel = axial[end] - axial[end - 1]
+                    current_sign = int(np.sign(travel)) if abs(travel) > reverse_tolerance else 0
+                    if current_sign and travel_sign and current_sign != travel_sign:
+                        reversed_at = True
+                        break
+                    travel_sign = current_sign or travel_sign
+                    end += 1
+                span = float(np.ptp(axial[start:end]))
+                score = (end - start, span)
+                if score[0] >= min_support and span >= diagonal * 0.04 and score > best_score:
+                    best = safe_points[start:end]
+                    best_score = score
+                # Include the turning point in the next run, without looping on it.
+                start = end - 1 if reversed_at and end - 1 > start else end
+
+    if best is None:
+        return None
+    centre = best.mean(axis=0)
+    _, _, axes = np.linalg.svd(best - centre, full_matrices=False)
+    direction = axes[0]
+    relative = best - centre
+    residuals = np.abs(relative[:, 0] * direction[1] -
+                       relative[:, 1] * direction[0])
+    if np.max(residuals) > tolerance * 2:
+        return None
+    positions = relative @ direction
+    start = centre + np.min(positions) * direction
+    end = centre + np.max(positions) * direction
+    return _clip_segment_to_pitch(start, end, pitch_length, pitch_width)
 
 
 # ==========================================
@@ -1371,16 +1442,25 @@ class Camera:
             traceback.print_exc()
     
     def _draw_view_direction_marker(self, image, scale: float, padding: int) -> bool:
-        """Draw a projected ground-view direction, not a physical camera pose."""
+        """Draw an inward-facing diagram marker, not a physical camera pose."""
         marker = self.fov_calculator.get_view_direction_marker(
             self.config.length, self.config.width
         )
         if marker is None:
             return False
-        anchor, forward = marker
+        anchor, _projected_direction = marker
+        # The projected image centreline can point outward near a pitch edge.
+        # For this *diagram only*, keep its near-end anchor but point the arrow
+        # toward the pitch centre so that it cannot suggest an outside view.
+        to_centre = np.array(
+            [self.config.length / 2.0, self.config.width / 2.0], dtype=np.float64
+        ) - anchor
+        distance = np.linalg.norm(to_centre)
+        if not np.isfinite(distance) or distance < 1.0:
+            return False
         marker_length = min(self.config.length, self.config.width) * 0.17
         clipped = _clip_segment_to_pitch(
-            anchor, anchor + marker_length * forward,
+            anchor, anchor + min(marker_length, distance) * to_centre / distance,
             self.config.length, self.config.width,
         )
         if clipped is None:
@@ -1464,35 +1544,18 @@ class Camera:
             result, scale=scale, padding=padding
         )
         
-        # 狭窄球场图也不能让说明文字盖住可见网格，因此单独增加底栏。
+        # 一行简短图例，避免底栏占据大量画面。
         legend_top = result.shape[0] + 8
         result = cv2.copyMakeBorder(
-            result, 0, 160, 0, 0, cv2.BORDER_CONSTANT,
+            result, 0, 40, 0, 0, cv2.BORDER_CONSTANT,
             value=(246, 246, 246),
         )
         result = self._put_chinese_text(
-            result, f"Camera {self.id} · 场地可见区域",
-            (padding, legend_top), font_size=18, color=(32, 32, 32),
+            result,
+            "蓝:可见区｜白:场线｜绿:视线方向" if marker_drawn else
+            "蓝:可见区｜白:场线｜方向未显示",
+            (12, legend_top), font_size=14, color=(32, 32, 32),
         )
-        result = self._put_chinese_text(
-            result, f"可见网格 {len(self.info.visible_grid_cells)} 个 · 单格 {self.grid_size:g} cm",
-            (padding, legend_top + 28), font_size=16, color=(32, 32, 32),
-        )
-        legend_items = (
-            ((255, 100, 0), "蓝色：可见区域"),
-            ((255, 255, 255), "白线：场地模型边界（标定坐标）"),
-            ((0, 255, 0), "绿色：视野近端与估计朝向（非相机位置）" if marker_drawn else
-             "绿色方向标记：无法可靠计算，已隐藏"),
-        )
-        for index, (color, label) in enumerate(legend_items):
-            y = legend_top + 55 + index * 28
-            cv2.rectangle(result, (padding, y + 2), (padding + 38, y + 21),
-                          (39, 92, 41), -1)
-            cv2.line(result, (padding + 5, y + 11), (padding + 34, y + 11), color, 3)
-            result = self._put_chinese_text(
-                result, label, (padding + 47, y), font_size=16,
-                color=(32, 32, 32),
-            )
         
         # 6. 保存（支持中文路径）
         output_path = self.store_dir / f"{self.name}_visible_grids_pitch.jpg"
@@ -1653,10 +1716,10 @@ class Camera:
     def _visualize_video_boundaries(self, num_samples: int = 100, 
                                      scale: float = 0.1, padding: int = 50):
         """
-        可视化视频画幅左右边缘在场地平面上的投影（不是场地标线）。
-        
-        只连接原始采样顺序中的相邻点，裁切到真实球场范围；不再对
-        X=f(Y) 作三次拟合，否则远离标定点时会出现误导性的夸张斜线。
+        可视化视频画幅左右边缘的直线近似（不是场地标线）。
+
+        每侧仅选一段稳定的原始采样，拟合一条有样本支持的虚直线；
+        不跨越投影折返点，也不延长到样本以外。
         
         Args:
             num_samples: 沿边界采样的点数（默认100，点越多线越平滑）
@@ -1677,7 +1740,6 @@ class Camera:
             np.zeros(num_samples),  # x = 0
             y_coords
         ])
-        
         right_boundary_video = np.column_stack([
             np.full(num_samples, w - 1),  # x = w - 1
             y_coords
@@ -1697,7 +1759,6 @@ class Camera:
             distortion_info=self.distortion_info if self.enable_distortion_correction else None,
             enable_k3=True
         )
-        
         right_boundary_pitch = video_pixel_to_pitch(
             right_boundary_video,
             self.homography_matrix,
@@ -1705,32 +1766,48 @@ class Camera:
             distortion_info=self.distortion_info if self.enable_distortion_correction else None,
             enable_k3=True
         )
-        
-        # 白框是场地模型边界；两条彩色虚线只是图像边缘的地面投影。
+
+        # 白框是场地模型边界；彩色虚线仅为画幅边缘的近似投影。
         from tools.pitch_annotation_tool import draw_pitch
         from tools.transform import pitch_to_canvas_pixel
 
         pitch_img = draw_pitch(config=self.config, scale=scale, padding=padding)
         pitch_length, pitch_width = self.config.length, self.config.width
         edge_specs = (
-            ("left", left_boundary_pitch, (255, 255, 0)),   # cyan
-            ("right", right_boundary_pitch, (255, 0, 255)),  # magenta
+            ("left", left_boundary_video, left_boundary_pitch, (255, 255, 0)),
+            ("right", right_boundary_video, right_boundary_pitch, (255, 0, 255)),
         )
-        for side, projected_samples, color in edge_specs:
-            segments = _projected_frame_edge_segments(
-                projected_samples, pitch_length, pitch_width
+        for side, video_samples, projected_samples, color in edge_specs:
+            # Without lens correction, a sign change in the homography's last
+            # row identifies a crossing of the perspective horizon.
+            denominators = None if self.enable_distortion_correction else (
+                video_samples @ self.homography_matrix[2, :2] +
+                self.homography_matrix[2, 2]
             )
-            # A sparse/dashed diagnostic line cannot be mistaken for a solid
-            # white pitch boundary, even when the two happen to overlap.
-            for index, (start, end) in enumerate(segments):
-                if index % 6 >= 3:
-                    continue
-                canvas = pitch_to_canvas_pixel(
-                    np.stack((start, end)), scale=scale, padding=padding
+            line = _projected_frame_edge_line(
+                projected_samples, pitch_length, pitch_width, denominators
+            )
+            if line is None:
+                print(f"  {side} image-edge projection: no reliable straight run")
+                continue
+            start, end = pitch_to_canvas_pixel(
+                np.stack(line), scale=scale, padding=padding
+            )
+            vector = end - start
+            length = float(np.linalg.norm(vector))
+            if length < 2:
+                continue
+            direction = vector / length
+            dash = min(14.0, max(2.0, length / 5.0))
+            gap = dash * 0.7
+            for offset in np.arange(0, length, dash + gap):
+                dash_start = start + offset * direction
+                dash_end = start + min(offset + dash, length) * direction
+                cv2.line(
+                    pitch_img, tuple(np.rint(dash_start).astype(np.int32)),
+                    tuple(np.rint(dash_end).astype(np.int32)), color, 2, cv2.LINE_AA,
                 )
-                pt1, pt2 = tuple(np.rint(canvas).astype(np.int32))
-                cv2.line(pitch_img, pt1, pt2, color, 2, cv2.LINE_AA)
-            print(f"  {side} image-edge projection: {len(segments)} clipped segments")
+            print(f"  {side} image-edge projection: one straight dashed line")
 
         target_w = int(pitch_length * scale)
         target_h = int(pitch_width * scale)
@@ -1744,36 +1821,18 @@ class Camera:
             pitch_img, scale=scale, padding=padding
         )
 
-        # Put the explanation below the field, not on top of the pitch lines.
+        # Keep the explanation below the field in one compact line.
         legend_top = pitch_img.shape[0] + 8
         pitch_img = cv2.copyMakeBorder(
-            pitch_img, 0, 145, 0, 0, cv2.BORDER_CONSTANT,
+            pitch_img, 0, 40, 0, 0, cv2.BORDER_CONSTANT,
             value=(246, 246, 246),
         )
         pitch_img = self._put_chinese_text(
-            pitch_img, f"Camera {self.id} · 画面边缘投影（中间 50% 高度）",
-            (padding, 10), font_size=20, color=(255, 255, 255),
+            pitch_img,
+            "白:场线｜青/紫:画幅投影近似｜绿:视线方向" if marker_drawn else
+            "白:场线｜青/紫:画幅投影近似｜方向未显示",
+            (12, legend_top), font_size=14, color=(32, 32, 32),
         )
-        legend_items = (
-            ((255, 255, 255), "白色实线：场地模型边界（标定坐标）", False),
-            ((255, 255, 0), "青色虚线：画面左边缘投影，不是场地标线", True),
-            ((255, 0, 255), "紫色虚线：画面右边缘投影，不是场地标线", True),
-            ((0, 255, 0), "绿色：视野近端与估计方向，不是物理相机位置" if marker_drawn else
-             "绿色方向标记：无法可靠计算，已隐藏", False),
-        )
-        for index, (color, label, dashed) in enumerate(legend_items):
-            y = legend_top + index * 31
-            cv2.rectangle(pitch_img, (padding, y + 3), (padding + 44, y + 23),
-                          (39, 92, 41), -1)
-            if dashed:
-                cv2.line(pitch_img, (padding + 4, y + 13), (padding + 17, y + 13), color, 2)
-                cv2.line(pitch_img, (padding + 25, y + 13), (padding + 40, y + 13), color, 2)
-            else:
-                cv2.line(pitch_img, (padding + 4, y + 13), (padding + 40, y + 13), color, 3)
-            pitch_img = self._put_chinese_text(
-                pitch_img, label, (padding + 54, y + 1), font_size=16,
-                color=(32, 32, 32),
-            )
         
         # 5. 保存图片（支持中文路径）
         output_path = self.store_dir / f"{self.name}_video_boundaries.png"
