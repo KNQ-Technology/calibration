@@ -225,7 +225,8 @@ class CameraFOVCalculator:
                  distortion_params: Optional[np.ndarray] = None,
                  distortion_info: Optional[dict] = None,
                  pitch_bounds: Optional[Tuple[float, float, float, float]] = None,
-                 num_boundary_samples: int = 100):
+                 num_boundary_samples: int = 100,
+                 orientation_sign: int = 1):
         """
         Args:
             image_shape: (height, width) 图像尺寸，例如 (1440, 2560)
@@ -234,12 +235,14 @@ class CameraFOVCalculator:
             distortion_info: 畸变信息字典，包含 center 等 (可选)
             pitch_bounds: 球场边界 (x_min, x_max, y_min, y_max)，用于边界检查
             num_boundary_samples: 边界采样点数（默认100，与可视化保持一致）
+            orientation_sign: 标定映射的局部方向；旧模式默认正方向
         """
         self.h, self.w = image_shape
         self.H = homography_matrix
         self.distortion_params = distortion_params
         self.distortion_info = distortion_info
         self.num_boundary_samples = num_boundary_samples
+        self.orientation_sign = orientation_sign
         
         # 球场边界（默认：足够大的范围）
         if pitch_bounds is None:
@@ -496,7 +499,8 @@ class CameraFOVCalculator:
                                                                     boundary_points_filtered, 
                                                                     self.get_pixel_points, 
                                                                     self.get_pitch_points,
-                                                                    self.w, self.h)]
+                                                                    self.w, self.h,
+                                                                    orientation_sign=self.orientation_sign)]
 
         filtered_count = len(boundary_points) - len(boundary_points_filtered)
         if filtered_count > 0:
@@ -810,7 +814,8 @@ class CameraFOVCalculator:
         visible_mask = check_valid.is_valid(grid_centers, 
                                             self.get_pixel_points, 
                                             self.get_pitch_points, 
-                                            self.w, self.h)
+                                            self.w, self.h,
+                                            orientation_sign=self.orientation_sign)
         
         # 5. 获取可见网格
         visible_cells = grid_indices[visible_mask]
@@ -922,6 +927,7 @@ class Camera:
         debug_mode: 调试模式 (默认: False)
             - True: 跳过读取已保存的畸变参数和 camera_info，强制重新计算，但仍然保存新结果
             - False: 优先读取已保存的标定数据
+        strict_calibration_dir: 只从当前标定目录加载文件，不回退查找旧目录 (默认: False)
     
     标定流程（首次运行自动触发）：
         1. 关键点标定 → keypoints.json
@@ -993,7 +999,8 @@ class Camera:
                  mcs_name: Optional[str] = None,
                  enable_distortion_correction: bool = True,
                  calibration_dir: Optional[str] = None,
-                 debug_mode: bool = False
+                 debug_mode: bool = False,
+                 strict_calibration_dir: bool = False,
                  ):
         """
         Args:
@@ -1009,6 +1016,8 @@ class Camera:
                            - 无 mcs_name: store/{camera_name}/
             debug_mode: 调试模式。为 True 时，跳过读取已保存的畸变参数和 camera_info，
                        强制重新计算，但仍然保存新计算的结果供后续使用
+            strict_calibration_dir: 为 True 时只从 calibration_dir 加载标定文件，
+                                    不回退到其他相机目录；用于独立的媒体标定任务
         """
         self.numeric_id = camera_id
         self.name = camera_name if camera_name else f"camera{camera_id}"
@@ -1021,6 +1030,7 @@ class Camera:
         self.transform_type = 'homography'
         self.video_manager = VideoManager(video_path)
         self.debug_mode = debug_mode
+        self.strict_calibration_dir = strict_calibration_dir
         
         # 畸变校正相关
         self.enable_distortion_correction = enable_distortion_correction
@@ -1103,6 +1113,13 @@ class Camera:
         
         if self.homography_matrix.shape != (3, 3):
             raise ValueError(f"单应性矩阵形状错误: 应为 (3, 3)，实际为 {self.homography_matrix.shape}")
+
+        # 四边映射允许从球场相反一侧拍摄，不能再以固定正方向过滤可见点。
+        # 四角顺序由已校验的边线决定；旧标定仍沿用正方向规则。
+        self.orientation_sign = (
+            check_valid.orientation_sign_from_quad(self.field_boundary_quad)
+            if self.field_boundary_quad is not None else 1
+        )
         
         # 3. 计算相机视野信息（支持畸变校正）
         # 定义球场合理范围（用于过滤异常点）
@@ -1120,7 +1137,8 @@ class Camera:
             distortion_params=self.distortion_params,
             distortion_info=self.distortion_info,
             pitch_bounds=pitch_bounds,
-            num_boundary_samples=100  # 与边界可视化保持一致
+            num_boundary_samples=100,  # 与边界可视化保持一致
+            orientation_sign=self.orientation_sign,
         )
         self.info = self.fov_calculator.calculate()
         
@@ -1316,7 +1334,8 @@ class Camera:
         valid_points = video_line[is_valid(line_points,
                                             self.fov_calculator.get_pixel_points,
                                             self.fov_calculator.get_pitch_points,
-                                            w, h)]
+                                            w, h,
+                                            orientation_sign=self.orientation_sign)]
 
         # 4. 绘制有效的线段
         if len(valid_points) >= 2:
@@ -1394,7 +1413,8 @@ class Camera:
             is_valid = check_valid.is_valid(pitch_points,
                                             self.fov_calculator.get_pixel_points,
                                             self.fov_calculator.get_pitch_points,
-                                            w, h)
+                                            w, h,
+                                            orientation_sign=self.orientation_sign)
 
             for i, (pt, pitch_pt) in enumerate(zip(video_points, pitch_points)):
                 # 检查是否为有效值（不是 NaN 或 Inf）
@@ -1601,7 +1621,8 @@ class Camera:
             is_valid = check_valid.is_valid(pitch_vertices,
                                             self.fov_calculator.get_pixel_points,
                                             self.fov_calculator.get_pitch_points,
-                                            w, h)
+                                            w, h,
+                                            orientation_sign=self.orientation_sign)
 
             for i, (pt, pitch_pt) in enumerate(zip(video_vertices, pitch_vertices)):
                 # 检查是否为有效值（不是 NaN 或 Inf）
@@ -1898,6 +1919,11 @@ class Camera:
         3. 独立目录 store/{camera_name}/
         """
         self.search_paths = [self.store_dir]
+
+        # 新媒体任务必须与旧相机缓存隔离；缺文件时由正常标定流程处理，
+        # 不能静默从 store/<camera_name> 复用其他视频的参数。
+        if self.strict_calibration_dir:
+            return
         
         # 添加备用路径
         if self.mcs_name:

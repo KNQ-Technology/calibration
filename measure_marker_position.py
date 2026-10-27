@@ -122,11 +122,10 @@ class MarkerMeasurement:
     
     def convert_to_pitch_coordinates(self):
         """将像素坐标转换为球场坐标"""
-        if not self.marker_groups_pixel:
-            print("⚠ 没有标志物数据")
-            return
-        
         self.marker_groups_pitch = []
+        if not self.marker_groups_pixel:
+            print("本次无器材标注，跳过器材坐标转换")
+            return
         
         for group_idx, pixel_group in enumerate(self.marker_groups_pixel):
             if not pixel_group:
@@ -248,12 +247,14 @@ class MarkerMeasurement:
         
         # 组概览
         report.append("\n【标志物组概览】")
+        if not self.marker_groups_pitch:
+            report.append("  本次无器材标注，跳过器材距离测量")
         for i, group in enumerate(self.marker_groups_pitch):
             equipment_type = self.equipment_types[i] if i < len(self.equipment_types) else '未指定'
             report.append(f"  组 {i+1}（{equipment_type}）: {len(group)} 个标志物")
         
         # 组内距离测量
-        if group_configs:
+        if self.marker_groups_pitch and group_configs:
             report.append("\n【组内距离测量】")
             for config in group_configs:
                 group_idx = config['group']
@@ -274,12 +275,15 @@ class MarkerMeasurement:
                     report.append(f"    平均间距: {result['average']:.2f} m")
         
         # 组间距离测量
-        if pair_configs:
+        if len(self.marker_groups_pitch) >= 2 and pair_configs:
             report.append("\n【组间距离测量】")
             for config in pair_configs:
                 g1_idx = config['group1']
                 g2_idx = config['group2']
                 measure_type = config.get('type', 'center')
+                if not (0 <= g1_idx < len(self.marker_groups_pitch)
+                        and 0 <= g2_idx < len(self.marker_groups_pitch)):
+                    continue
                 
                 report.append(f"\n  组 {g1_idx+1} ↔ 组 {g2_idx+1}:")
                 
@@ -363,6 +367,9 @@ class MarkerMeasurement:
                 g1_idx = config['group1']
                 g2_idx = config['group2']
                 measure_type = config.get('type', 'center')
+                if not (0 <= g1_idx < len(self.marker_groups_pitch)
+                        and 0 <= g2_idx < len(self.marker_groups_pitch)):
+                    continue
                 
                 if measure_type in ['center', 'both']:
                     pitch_img = draw_distance_between_groups(
@@ -448,13 +455,15 @@ def load_configure():
     store_root = cfg.get('store_dir') or 'store'
     if not os.path.isabs(store_root):
         store_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), store_root)
-    return video_path, cfg['CAMERA_NAME'], cfg['config'], cfg['GROUP_CONFIGS'], cfg['PAIR_CONFIGS'], store_root
+    return (video_path, cfg['CAMERA_NAME'], cfg['config'], cfg['GROUP_CONFIGS'],
+            cfg['PAIR_CONFIGS'], store_root, cfg.get('isolated_calibration_session') is True)
 
 def main():
     """主函数示例"""
     
     # 配置测量参数
-    VIDEO_PATH, CAMERA_NAME, config, GROUP_CONFIGS, PAIR_CONFIGS, STORE_ROOT = load_configure()
+    (VIDEO_PATH, CAMERA_NAME, config, GROUP_CONFIGS, PAIR_CONFIGS,
+     STORE_ROOT, ISOLATED_SESSION) = load_configure()
     config = getattr(soccer, config)()  # 从 soccer 模块加载配置对象
     # ========== 执行流程 ==========
     
@@ -481,7 +490,8 @@ def main():
         video_path=VIDEO_PATH,
         pitch_config=config,
         camera_name=CAMERA_NAME,
-        calibration_dir=store_path
+        calibration_dir=store_path,
+        strict_calibration_dir=ISOLATED_SESSION,
     )
 
     # 2. 创建测量对象
@@ -495,14 +505,23 @@ def main():
     markers_cache = measurement.output_dir / "markers.json"
     if markers_cache.exists():
         print(f"✨ 发现缓存文件: {markers_cache}")
-        use_cache = input("是否使用缓存？(y/n，默认y): ").strip().lower()
-        
-        if use_cache != 'n':
-            # 选项1: 加载已有标注
+        try:
+            with markers_cache.open("r", encoding="utf-8") as handle:
+                cache_data = json.load(handle)
+            no_equipment = isinstance(cache_data, dict) and cache_data.get("groups") == []
+        except (OSError, ValueError):
+            no_equipment = False
+        if no_equipment:
+            print("本次无器材，自动使用已保存的空标注")
             success = measurement.load_markers()
         else:
-            # 选项2: 进行新标注（会覆盖缓存）
-            success = measurement.annotate_markers()
+            use_cache = input("是否使用缓存？(y/n，默认y): ").strip().lower()
+            if use_cache != 'n':
+                # 选项1: 加载已有标注
+                success = measurement.load_markers()
+            else:
+                # 选项2: 进行新标注（会覆盖缓存）
+                success = measurement.annotate_markers()
     else:
         # 首次标注
         print("⚠ 未发现缓存，开始新标注...")
@@ -510,7 +529,7 @@ def main():
     
     if not success:
         print("❌ 标注失败或取消，退出")
-        return
+        raise SystemExit(1)
     
     # 4. 转换坐标
     print("\n[4/5] 转换坐标到球场系统...")

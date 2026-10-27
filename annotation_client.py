@@ -4,13 +4,11 @@
 按照标定业务流程组织标注步骤：
 
     1. 项目设置      -> config.yaml
-    2. 关键点标注    -> store/{CAMERA_NAME}/keypoints.json
-    3. 横向直线标注  -> store/{CAMERA_NAME}/manual_horizontal.json
-    4. 纵向直线标注  -> store/{CAMERA_NAME}/manual_vertical.json
-    5. 四条边线标定  -> store/{CAMERA_NAME}/field_boundary.json（可选）
-    6. 训练区域      -> store/{CAMERA_NAME}/train_area.json
-    7. 器材分组      -> store/manual/{CAMERA_NAME}/markers.json
-    8. 保存与测量    -> 运行 measure_marker_position.py
+    2. 四条边线标定  -> store/{CAMERA_NAME}/field_boundary.json（默认）
+       关闭四边标定时，插入必选的关键点、横向直线、纵向直线标注
+    3/6. 训练区域    -> store/{CAMERA_NAME}/train_area.json
+    4/7. 器材分组    -> store/manual/{CAMERA_NAME}/markers.json
+    5/8. 保存与测量  -> 运行 measure_marker_position.py
 
 生成的 JSON 与主流程 (camera.py / de_distortion.py / measure_marker_position.py)
 完全兼容；启动时自动加载已有标注缓存，保存时直接写入规范路径。
@@ -27,12 +25,15 @@ import json
 import math
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 # ======================================================================
 # 环境自检与准备（必须在导入第三方库之前执行）
@@ -153,6 +154,7 @@ from field_boundary import (
     load_boundary,
     validate_boundary_data,
 )
+from calibration_quality import inspect_calibration_quality
 import soccer
 
 
@@ -248,11 +250,13 @@ def wheel_steps(event) -> int:
 
 Point = Tuple[int, int]
 BOUNDARY_KEYS = ("top", "right", "bottom", "left")
+# 只控制向导的展示顺序；JSON 字段及场地坐标映射仍按 BOUNDARY_KEYS 保存。
+BOUNDARY_UI_ORDER = ("left", "top", "right", "bottom")
 BOUNDARY_LABELS = {
-    "top": "上边线（球场 y=0）",
-    "right": "右端线（球场 x=长度）",
-    "bottom": "下边线（球场 y=宽度）",
-    "left": "左端线（球场 x=0）",
+    "top": "上边线",
+    "right": "右端线",
+    "bottom": "下边线",
+    "left": "左端线",
 }
 BOUNDARY_COLORS = {
     "top": "#22c55e", "right": "#38bdf8",
@@ -282,12 +286,20 @@ STEP_DEFS: List[StepDef] = [
         "「应用并保存配置」会更新根目录 config.yaml，\n"
         "后续所有标注文件都会保存到\n"
         "store/{相机名}/ 与 store/manual/{相机名}/ 下。\n\n"
-        "器材组数、每组器材类型在第 7 步设置。",
+        "器材组数、每组器材类型在“器材分组”步骤设置。",
+    ),
+    StepDef(
+        "field_boundary",
+        "四条边线标定",
+        "默认启用四边标定：按球场示意图依次选择左、上、右、下边线，"
+        "每条在画面中点击两个位置。\n\n"
+        "标完后请预览球场线投影并核对方向。"
+        "关闭四边标定后，改用必选的关键点、横向直线和纵向直线标注。",
     ),
     StepDef(
         "keypoints",
         "关键点标注",
-        "在画面中标注球场关键点（旧模式用于计算单应矩阵；启用四边标定时可跳过）。\n\n"
+        "旧模式必选：在画面中标注球场关键点，用于计算单应矩阵。\n\n"
         "1. 在下拉框选择顶点编号（可点「查看场地图编号」对照）\n"
         "2. 左键在画面中点击该关键点的位置\n"
         "3. 标注后自动跳到下一个未标注的顶点\n\n"
@@ -297,7 +309,7 @@ STEP_DEFS: List[StepDef] = [
     StepDef(
         "manual_h",
         "横向直线标注",
-        "标注画面中真实世界为『横向直线』的线\n"
+        "旧模式必选：标注画面中真实世界为『横向直线』的线\n"
         "（如上下边线、禁区横线），用于畸变标定。\n\n"
         "每组对应一条直线：沿线均匀点 5 个以上点，\n"
         "然后「新建分组」标注下一条。\n\n"
@@ -306,22 +318,11 @@ STEP_DEFS: List[StepDef] = [
     StepDef(
         "manual_v",
         "纵向直线标注",
-        "标注画面中真实世界为『纵向直线』的线\n"
+        "旧模式必选：标注画面中真实世界为『纵向直线』的线\n"
         "（如底线、中线、禁区纵线），用于畸变标定。\n\n"
         "每组对应一条直线：沿线均匀点 5 个以上点，\n"
         "然后「新建分组」标注下一条。\n\n"
         "建议至少标注 2 条分布在画面不同位置的纵线。",
-    ),
-    StepDef(
-        "field_boundary",
-        "四条边线标定",
-        "可选：按球场示意图依次选择上、右、下、左边线，"
-        "每条在画面中点击两个位置。看不清的边线可按已有线索推定，"
-        "请勾选『推定』以记录不确定性。\n\n"
-        "保存后，主流程优先使用四条边线求场地映射，并以其范围筛选球员；"
-        "无需先标旧关键点。未保存时完全沿用旧模式。"
-        "四条边线都标完后，请预览球场线投影并核对方向。",
-        optional=True,
     ),
     StepDef(
         "train_area",
@@ -338,11 +339,12 @@ STEP_DEFS: List[StepDef] = [
     StepDef(
         "markers",
         "器材分组",
-        "标注要测量的标志物（如障碍桶）。\n\n"
-        "先设置器材组数，并为当前组选择器材类型和训练形式。\n"
-        "切换组后左键添加点；每组至少标注一个点。\n\n"
+        "器材标注为选填。没有器材可直接进入“保存与测量”。\n\n"
+        "需要测量器材距离时，设置组数、类型和训练形式，"
+        "切换组后在画面中标点；未标点的空组会被忽略。\n\n"
         "线型只测量相邻点；环型还测量末点到首点。\n"
         "组间距离仍由 config.yaml 中的 PAIR_CONFIGS 决定。",
+        optional=True,
     ),
     StepDef(
         "finish",
@@ -357,6 +359,7 @@ STEP_DEFS: List[StepDef] = [
 
 STEP_KEYS = [s.key for s in STEP_DEFS]
 GROUP_STEPS = {"manual_h", "manual_v", "markers"}
+LEGACY_STEP_KEYS = {"keypoints", "manual_h", "manual_v"}
 
 
 class AnnotationClient(tk.Tk):
@@ -395,33 +398,26 @@ class AnnotationClient(tk.Tk):
         self.display_image: Optional[Image.Image] = None
         self.tk_image: Optional[ImageTk.PhotoImage] = None
         self.source_path: Optional[Path] = None
+        self.media_kind = self.config_data.get("annotation_media_kind", "video")
+        self.media_identity = self.config_data.get("annotation_media_identity")
+        self._measurement_running = False
         self.frame_bgr = self._load_default_frame()
         self.image_h, self.image_w = self.frame_bgr.shape[:2]
 
         # ---- 标注数据 ----
         self.keypoints: List[KeypointAnnotation] = []
-        configured_groups = self.config_data.get("GROUP_CONFIGS")
-        configured_indices = []
-        if isinstance(configured_groups, list):
-            for item in configured_groups:
-                try:
-                    configured_indices.append(int(item["group"]))
-                except (TypeError, KeyError, ValueError):
-                    continue
-        configured_count = max(configured_indices, default=0) + 1
-        self.marker_groups: List[List[Point]] = [[] for _ in range(max(1, min(99, configured_count)))]
-        self.marker_equipment_types: List[str] = [DEFAULT_EQUIPMENT_TYPE] * len(self.marker_groups)
-        self.marker_group_closed: List[bool] = load_group_closed_modes(
-            self.config_data, len(self.marker_groups))
-        self._config_source_indices = list(range(len(self.marker_groups)))
+        self.keypoint_source_name = ""
+        # Only saved marker points establish an existing group.  Older configs
+        # often contain a default group 0 even when no equipment was marked.
+        self.marker_groups: List[List[Point]] = []
+        self.marker_equipment_types: List[str] = []
+        self.marker_group_closed: List[bool] = []
+        self._config_source_indices: List[int] = []
         self.manual_h_groups: List[List[Point]] = [[]]
         self.manual_v_groups: List[List[Point]] = [[]]
         self.boundary_edges: Dict[str, List[Point]] = {key: [] for key in BOUNDARY_KEYS}
-        self.boundary_edge_var = tk.StringVar(value="top")
+        self.boundary_edge_var = tk.StringVar(value=BOUNDARY_UI_ORDER[0])
         self.boundary_enabled_var = tk.BooleanVar(value=True)
-        self.boundary_estimated_vars = {
-            key: tk.BooleanVar(value=False) for key in BOUNDARY_KEYS
-        }
         self.boundary_status_var = tk.StringVar(value="四条边线各标记两个点后可保存")
         self.boundary_preview_lines = False
         self.boundary_source_name = ""
@@ -430,22 +426,26 @@ class AnnotationClient(tk.Tk):
         self.train_area_tokens = tk.StringVar(value="")
 
         self.current_step_index = 0
-        self.current_group = tk.IntVar(value=1)
+        self.current_group = tk.IntVar(value=0)
         self.marker_group_count_var = tk.StringVar(value=str(len(self.marker_groups)))
         self.marker_equipment_type_var = tk.StringVar(value=DEFAULT_EQUIPMENT_TYPE)
-        self.marker_layout_var = tk.StringVar(
-            value="ring" if self.marker_group_closed[0] else "line")
-        self._active_marker_type_index = 0
+        self.marker_layout_var = tk.StringVar(value="line")
+        self._active_marker_type_index = -1
         self.selected_vertex = tk.IntVar(value=0)
 
         # 项目设置变量
-        self.video_path_var = tk.StringVar(value=str(self._default_video_path()))
+        default_video = self._default_video_path()
+        self.video_path_var = tk.StringVar(value=str(default_video) if default_video else "")
         self.camera_name_var = tk.StringVar(value=self.camera_name)
         self.store_root = self.config_data.get("store_dir") or "store"
+        self.store_base_root = self.config_data.get("store_base_dir") or self.store_root
+        self.isolated_calibration_session = bool(
+            self.config_data.get("isolated_calibration_session", False))
         self.store_root_var = tk.StringVar(value=self.store_root)
 
         self._load_existing_annotations()
         self._build_ui()
+        self._sync_media_controls()
         self.marker_equipment_type_var.trace_add("write", self._remember_marker_equipment_type)
         self._refresh_vertex_options()
         self._select_step(self._first_incomplete_step())
@@ -491,9 +491,11 @@ class AnnotationClient(tk.Tk):
         config_cls = getattr(soccer, class_name, soccer.QingYuanConfiguration)
         return config_cls()
 
-    def _default_video_path(self) -> Path:
+    def _default_video_path(self) -> Optional[Path]:
         dir_path = self.config_data.get("dir_path") or "."
         video_name = self.config_data.get("video_name") or ""
+        if not video_name:
+            return None
         path = Path(dir_path) / video_name
         if not path.is_absolute():
             path = self.project_dir / path
@@ -527,9 +529,13 @@ class AnnotationClient(tk.Tk):
     # ------------------------------------------------------------------
 
     def _load_default_frame(self):
-        video_path = self._default_video_path()
-        self.source_path = video_path
-        frame = self._read_video_frame(video_path, self.frame_index.get())
+        saved_source = self.config_data.get("annotation_media_path")
+        source = Path(saved_source) if saved_source else self._default_video_path()
+        self.source_path = source
+        if source and self.media_kind == "image":
+            frame = self._read_image(source)
+        else:
+            frame = self._read_video_frame(source, self.frame_index.get())
         if frame is not None:
             return frame
         blank = np.full((720, 1280, 3), (32, 24, 16), dtype=np.uint8)
@@ -546,6 +552,139 @@ class AnnotationClient(tk.Tk):
         cap.release()
         return frame if ok else None
 
+    def _read_image(self, path: Path):
+        if not path.exists():
+            return None
+        try:
+            return cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+        except (OSError, ValueError, cv2.error):
+            return None
+
+    @staticmethod
+    def _media_file_identity(path: Path) -> Dict[str, Any]:
+        stat = path.stat()
+        return {"path": str(path.resolve()), "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns}
+
+    def _sync_media_controls(self) -> None:
+        state = ["disabled"] if self.media_kind == "image" else ["!disabled"]
+        for widget in (getattr(self, "frame_index_entry", None),
+                       getattr(self, "load_frame_button", None)):
+            if widget is not None:
+                widget.state(state)
+
+    def _reset_annotation_state(self) -> None:
+        """Clear all in-memory annotations before displaying a different source."""
+        # Variable traces can refresh the current step while the reset runs.
+        self.current_step_index = 0
+        self.boundary_enabled_var.set(True)
+        self.keypoints = []
+        self.keypoint_source_name = ""
+        self._keypoint_geometry_warning = None
+        self.manual_h_groups = [[]]
+        self.manual_v_groups = [[]]
+        self.boundary_edges = {key: [] for key in BOUNDARY_KEYS}
+        self.boundary_source_name = ""
+        self.boundary_preview_lines = False
+        self.train_area_points = []
+        self.train_area_region = []
+        self.train_area_tokens.set("")
+        self.marker_groups = []
+        self.marker_equipment_types = []
+        self.marker_group_closed = []
+        self._config_source_indices = []
+        self.marker_group_count_var.set("0")
+        self.current_group.set(0)
+        self._active_marker_type_index = -1
+        self.marker_equipment_type_var.set(DEFAULT_EQUIPMENT_TYPE)
+        self.marker_layout_var.set("line")
+        if hasattr(self, "_sync_marker_group_controls"):
+            self._sync_marker_group_controls()
+        self.boundary_edge_var.set(BOUNDARY_UI_ORDER[0])
+        self.boundary_status_var.set("四条边线各标记两个点后可保存")
+        self.frame_index.set(0)
+        self.selected_vertex.set(0)
+        if hasattr(self, "vertex_combo") and self.vertex_combo["values"]:
+            self.vertex_combo.current(0)
+
+    def _activate_new_media(self, path: Path, frame, kind: str) -> bool:
+        """Give a new image/video a blank, private output root; never delete old work."""
+        if self._measurement_running:
+            messagebox.showwarning("导入文件", "测量正在运行，请完成后再导入新文件。")
+            return False
+        path = Path(path).resolve()
+        try:
+            identity = self._media_file_identity(path)
+        except OSError as exc:
+            messagebox.showerror("导入文件", f"无法读取文件：\n{path}\n{exc}")
+            return False
+        if (identity == self.media_identity and kind == self.media_kind
+                and self.source_path and self.source_path.resolve() == path):
+            self.frame_index.set(0)
+            self.set_frame(frame)
+            self.status.set(f"已重新打开当前文件：{path.name}，标注保持不变")
+            return True
+        if self.source_path and not messagebox.askokcancel(
+            "开始新标定任务",
+            f"将导入新{('视频' if kind == 'video' else '图片')}：{path.name}\n\n"
+            "当前画布和完成状态会清空；已保存的旧标定及报告会保留。"
+            "尚未保存的修改无法恢复。\n\n确定继续吗？",
+        ):
+            return False
+        configured_base = Path(self.store_base_root or "store")
+        base = configured_base if configured_base.is_absolute() else self.project_dir / configured_base
+        label = re.sub(r"[^\w-]+", "-", path.stem, flags=re.UNICODE).strip("-")[:32] or "media"
+        session_name = f"{datetime.now():%Y%m%d-%H%M%S}-{label}-{uuid4().hex[:8]}"
+        session_root = base / "_media_sessions" / session_name
+        configured_session = configured_base / "_media_sessions" / session_name
+        config = self._load_config()
+        config["store_base_dir"] = str(configured_base)
+        config["store_dir"] = str(configured_session)
+        config["isolated_calibration_session"] = True
+        config["annotation_media_path"] = str(path)
+        config["annotation_media_kind"] = kind
+        config["annotation_media_identity"] = identity
+        config["dir_path"] = str(path.parent) if kind == "video" else ""
+        config["video_name"] = path.name if kind == "video" else ""
+        config["CAMERA_NAME"] = self.camera_name
+        config["config"] = self.selected_pitch_config.get()
+        config["GROUP_CONFIGS"] = []
+        config["PAIR_CONFIGS"] = []
+        modes = config.get("four_boundary_enabled_by_camera")
+        modes = dict(modes) if isinstance(modes, dict) else {}
+        modes[self.camera_name] = True
+        config["four_boundary_enabled_by_camera"] = modes
+        config_path = self.project_dir / "config.yaml"
+        temp_path = config_path.with_name(f".{config_path.name}.{uuid4().hex}.tmp")
+        try:
+            session_root.mkdir(parents=True, exist_ok=False)
+            if config_path.exists():
+                (session_root / "previous_config.yaml").write_bytes(config_path.read_bytes())
+            with temp_path.open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(config, handle, allow_unicode=True, sort_keys=False)
+            os.replace(temp_path, config_path)
+        except OSError as exc:
+            temp_path.unlink(missing_ok=True)
+            messagebox.showerror("导入文件", f"无法创建新标定任务：\n{exc}")
+            return False
+        self.config_data = config
+        self.store_root = str(configured_session)
+        self.store_root_var.set(self.store_root)
+        self.isolated_calibration_session = True
+        self.media_kind = kind
+        self.media_identity = identity
+        self.source_path = path
+        self.video_path_var.set(str(path) if kind == "video" else "")
+        self._reset_annotation_state()
+        self.set_frame(frame)
+        if hasattr(self, "train_area_status"):
+            self._refresh_train_area_status()
+        self._sync_media_controls()
+        self._refresh_store_dir_hint()
+        self._select_step(0)
+        self.status.set(f"新标定任务已建立：{path.name}；旧文件已保留")
+        return True
+
     def open_video(self) -> None:
         path = filedialog.askopenfilename(
             initialdir=str(self.project_dir),
@@ -553,9 +692,11 @@ class AnnotationClient(tk.Tk):
         )
         if not path:
             return
-        self.source_path = Path(path)
-        self.video_path_var.set(path)
-        self.load_frame_at_index()
+        frame = self._read_video_frame(Path(path), 0)
+        if frame is None:
+            messagebox.showerror("打开视频", "视频打开失败或无法读取首帧；当前标定未改变。")
+            return
+        self._activate_new_media(Path(path), frame, "video")
 
     def open_image(self) -> None:
         path = filedialog.askopenfilename(
@@ -564,14 +705,16 @@ class AnnotationClient(tk.Tk):
         )
         if not path:
             return
-        frame = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        frame = self._read_image(Path(path))
         if frame is None:
             messagebox.showerror("打开图片", "图片打开失败。")
             return
-        self.source_path = Path(path)
-        self.set_frame(frame)
+        self._activate_new_media(Path(path), frame, "image")
 
     def load_frame_at_index(self) -> None:
+        if self.media_kind == "image":
+            messagebox.showinfo("加载帧", "当前来源是图片，没有视频帧号。")
+            return
         if not self.source_path:
             self.source_path = self._default_video_path()
         frame = self._read_video_frame(self.source_path, self.frame_index.get())
@@ -605,12 +748,13 @@ class AnnotationClient(tk.Tk):
     def _load_existing_annotations(self) -> None:
         loaded = []
         self.keypoints = []
+        self.keypoint_source_name = ""
         self.boundary_edges = {key: [] for key in BOUNDARY_KEYS}
         self.boundary_preview_lines = False
         self.boundary_source_name = ""
-        self.boundary_enabled_var.set(True)
-        for value in self.boundary_estimated_vars.values():
-            value.set(False)
+        saved_modes = self.config_data.get("four_boundary_enabled_by_camera", {})
+        saved_mode = saved_modes.get(self.camera_name) if isinstance(saved_modes, dict) else None
+        self.boundary_enabled_var.set(saved_mode if isinstance(saved_mode, bool) else True)
         self._keypoint_geometry_warning = None
         path = self._step_save_path("keypoints")
         if path and path.exists():
@@ -620,6 +764,7 @@ class AnnotationClient(tk.Tk):
                     KeypointAnnotation(index, image)
                     for index, image in _validate_saved_keypoints(data, self.pitch_config)
                 ]
+                self.keypoint_source_name = str(data.get("source") or "")
                 loaded.append(f"关键点 {len(self.keypoints)} 个")
             except (OSError, ValueError, TypeError) as exc:
                 self._keypoint_geometry_warning = f"已有关键点未加载：{exc}"
@@ -648,9 +793,11 @@ class AnnotationClient(tk.Tk):
                         setattr(self, attr, groups)
                         if key == "markers":
                             self.marker_equipment_types = equipment_types
-                            self.marker_group_closed = resize_group_closed_modes(
-                                self.marker_group_closed, len(groups))
+                            self.marker_group_closed = load_group_closed_modes(
+                                self.config_data, len(groups))
+                            self._config_source_indices = list(range(len(groups)))
                             self.marker_group_count_var.set(str(len(groups)))
+                            self.current_group.set(1)
                         loaded.append(f"{key} {len(groups)} 组")
                 except Exception:
                     pass
@@ -666,9 +813,6 @@ class AnnotationClient(tk.Tk):
                     self.boundary_edges[key] = [
                         (int(x), int(y)) for x, y in data["edges"][key]["points"]
                     ]
-                    self.boundary_estimated_vars[key].set(
-                        bool(data["edges"][key].get("estimated", False))
-                    )
                 self.boundary_enabled_var.set(bool(data["enabled"]))
                 self.boundary_source_name = str(data.get("source") or "")
                 loaded.append("四条边线" if data["enabled"] else "四条边线已停用")
@@ -712,31 +856,47 @@ class AnnotationClient(tk.Tk):
         if key == "manual_v":
             return any(len(g) >= 2 for g in self.manual_v_groups)
         if key == "field_boundary":
-            return all(len(self.boundary_edges[name]) == 2 for name in BOUNDARY_KEYS)
+            return not self.boundary_enabled_var.get() or all(
+                len(self.boundary_edges[name]) == 2 for name in BOUNDARY_KEYS)
         if key == "train_area":
             return len(self.train_area_region) >= 3
         if key == "markers":
-            return bool(self.marker_groups) and all(self.marker_groups)
+            return any(bool(group) for group in self.marker_groups)
         if key == "finish":
             return (self._manual_dir() / "measurement_report.txt").exists()
         return False
 
     def _first_incomplete_step(self) -> int:
-        for i, step in enumerate(STEP_DEFS):
+        steps = self._active_steps()
+        for i, step in enumerate(steps):
             if step.key == "finish":
                 return i
             if step.optional:
                 continue
             if not self._step_complete(step.key):
                 return i
-        return len(STEP_DEFS) - 1
+        return len(steps) - 1
+
+    def _active_steps(self) -> List[StepDef]:
+        if self.boundary_enabled_var.get():
+            return [step for step in STEP_DEFS if step.key not in LEGACY_STEP_KEYS]
+        return STEP_DEFS
+
+    def _select_step_by_key(self, key: str) -> None:
+        for index, step in enumerate(self._active_steps()):
+            if step.key == key:
+                self._select_step(index)
+                return
+        raise ValueError(f"当前流程没有步骤：{key}")
 
     def _refresh_step_list(self) -> None:
         if not hasattr(self, "step_listbox"):
             return
-        selection = self.current_step_index
+        steps = self._active_steps()
+        selection = min(self.current_step_index, len(steps) - 1)
         self.step_listbox.delete(0, tk.END)
-        for i, step in enumerate(STEP_DEFS):
+        self.step_listbox.configure(height=len(steps))
+        for i, step in enumerate(steps):
             done = self._step_complete(step.key)
             icon = "✔" if done else ("△" if step.optional else "○")
             self.step_listbox.insert(tk.END, f" {icon}  {i + 1}. {step.title}")
@@ -791,7 +951,7 @@ class AnnotationClient(tk.Tk):
         ttk.Label(left, text="标定流程", font=(UI_FONT, 11, "bold")).grid(
             row=0, column=0, sticky="w", pady=(0, 6))
         self.step_listbox = tk.Listbox(
-            left, height=len(STEP_DEFS), exportselection=False,
+            left, height=len(self._active_steps()), exportselection=False,
             font=(UI_FONT, 10), activestyle="none",
         )
         self.step_listbox.grid(row=1, column=0, sticky="new")
@@ -888,8 +1048,10 @@ class AnnotationClient(tk.Tk):
         ttk.Button(toolbar, text="打开视频", command=self.open_video).grid(row=0, column=0, padx=4)
         ttk.Button(toolbar, text="打开图片", command=self.open_image).grid(row=0, column=1, padx=4)
         ttk.Label(toolbar, text="帧号").grid(row=0, column=2, padx=(14, 4))
-        ttk.Entry(toolbar, textvariable=self.frame_index, width=8).grid(row=0, column=3, padx=4)
-        ttk.Button(toolbar, text="加载帧", command=self.load_frame_at_index).grid(row=0, column=4, padx=4)
+        self.frame_index_entry = ttk.Entry(toolbar, textvariable=self.frame_index, width=8)
+        self.frame_index_entry.grid(row=0, column=3, padx=4)
+        self.load_frame_button = ttk.Button(toolbar, text="加载帧", command=self.load_frame_at_index)
+        self.load_frame_button.grid(row=0, column=4, padx=4)
         ttk.Button(toolbar, text="适应窗口", command=self.fit_and_redraw).grid(row=0, column=5, padx=(14, 4))
         ttk.Button(toolbar, text="放大", command=lambda: self.zoom(1.2)).grid(row=0, column=6, padx=4)
         ttk.Button(toolbar, text="缩小", command=lambda: self.zoom(1 / 1.2)).grid(row=0, column=7, padx=4)
@@ -926,14 +1088,17 @@ class AnnotationClient(tk.Tk):
         self.common_actions.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         for i in range(2):
             self.common_actions.columnconfigure(i, weight=1)
-        ttk.Button(self.common_actions, text="撤销", command=self.undo).grid(
+        self.undo_button = ttk.Button(self.common_actions, text="撤销", command=self.undo)
+        self.undo_button.grid(
             row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(self.common_actions, text="清空本步", command=self.clear_current).grid(
+        self.clear_step_button = ttk.Button(self.common_actions, text="清空本步", command=self.clear_current)
+        self.clear_step_button.grid(
             row=0, column=1, sticky="ew", padx=(4, 0))
         self.save_step_button = ttk.Button(self.common_actions, text="保存本步",
                                            command=self.save_current_step)
         self.save_step_button.grid(row=1, column=0, sticky="ew", pady=(8, 0), padx=(0, 4))
-        ttk.Button(self.common_actions, text="生成预览图", command=self.save_preview).grid(
+        self.preview_step_button = ttk.Button(self.common_actions, text="生成预览图", command=self.save_preview)
+        self.preview_step_button.grid(
             row=1, column=1, sticky="ew", pady=(8, 0), padx=(4, 0))
 
         # 标注列表
@@ -957,7 +1122,7 @@ class AnnotationClient(tk.Tk):
 
         ttk.Label(box, text="视频文件（输入）").grid(row=0, column=0, sticky="w")
         ttk.Entry(box, textvariable=self.video_path_var).grid(row=1, column=0, sticky="ew")
-        ttk.Button(box, text="浏览视频…", command=self.open_video).grid(row=2, column=0, sticky="ew", pady=(4, 8))
+        ttk.Button(box, text="浏览视频…", command=self.browse_setup_video).grid(row=2, column=0, sticky="ew", pady=(4, 8))
 
         ttk.Label(box, text="输出目录（标定与测量结果根目录）").grid(row=3, column=0, sticky="w")
         ttk.Entry(box, textvariable=self.store_root_var).grid(row=4, column=0, sticky="ew")
@@ -981,11 +1146,11 @@ class AnnotationClient(tk.Tk):
 
         ttk.Button(box, text="应用并保存配置 (config.yaml)",
                    command=self.apply_setup).grid(row=11, column=0, sticky="ew")
-        ttk.Label(box, text="器材组数、类型和训练形式请在第 7 步设置。",
+        ttk.Label(box, text="器材组数、类型和训练形式请在“器材分组”步骤设置。",
                   foreground="#475569", wraplength=280, justify="left").grid(
                       row=12, column=0, sticky="w", pady=(12, 4))
-        ttk.Button(box, text="前往第 7 步 · 设置器材分组",
-                   command=lambda: self._select_step(STEP_KEYS.index("markers"))).grid(
+        ttk.Button(box, text="前往器材分组",
+                   command=lambda: self._select_step_by_key("markers")).grid(
                        row=13, column=0, sticky="ew")
         self._refresh_store_dir_hint()
 
@@ -995,6 +1160,29 @@ class AnnotationClient(tk.Tk):
                                                       else self.project_dir))
         if path:
             self.store_root_var.set(path)
+
+    def browse_setup_video(self) -> None:
+        """In image mode, choose a measurement video without replacing its frame."""
+        if self.media_kind != "image":
+            self.open_video()
+            return
+        path = filedialog.askopenfilename(
+            initialdir=str(self.project_dir),
+            filetypes=[("视频文件", "*.mp4 *.avi *.mov *.mkv"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        frame = self._read_video_frame(Path(path), 0)
+        if frame is None:
+            messagebox.showerror("选择视频", "视频打开失败或无法读取首帧。")
+            return
+        if frame.shape[:2] != (self.image_h, self.image_w):
+            messagebox.showwarning(
+                "选择视频", "视频与当前图片的分辨率不同，标注坐标不能直接使用。"
+                "请导入同分辨率的视频，或改用“打开视频”开始新任务。")
+            return
+        self.video_path_var.set(str(Path(path).resolve()))
+        self.status.set(f"已关联测量视频：{Path(path).name}；请应用并保存配置")
 
     def _refresh_store_dir_hint(self) -> None:
         if hasattr(self, "store_dir_hint"):
@@ -1048,34 +1236,36 @@ class AnnotationClient(tk.Tk):
         box = ttk.LabelFrame(panel, text="四条场地边线", padding=8)
         box.grid(row=0, column=0, sticky="ew")
         box.columnconfigure(0, weight=1)
+        ttk.Checkbutton(
+            box, text="启用四边标定",
+            variable=self.boundary_enabled_var,
+            command=self._on_boundary_mode_change,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        self.boundary_edit_widgets: List[ttk.Widget] = []
         self.boundary_count_labels: Dict[str, ttk.Label] = {}
-        for row_index, key in enumerate(BOUNDARY_KEYS):
+        for row_index, key in enumerate(BOUNDARY_UI_ORDER):
             row = ttk.Frame(box)
-            row.grid(row=row_index, column=0, sticky="ew", pady=(0, 6))
+            row.grid(row=row_index + 1, column=0, sticky="ew", pady=(0, 6))
             row.columnconfigure(0, weight=1)
-            ttk.Radiobutton(
+            edge_radio = ttk.Radiobutton(
                 row, text=BOUNDARY_LABELS[key], value=key,
                 variable=self.boundary_edge_var,
                 command=self._refresh_boundary_status,
-            ).grid(row=0, column=0, sticky="w")
+            )
+            edge_radio.grid(row=0, column=0, sticky="w")
+            self.boundary_edit_widgets.append(edge_radio)
             count_label = ttk.Label(row, text="0/2")
-            count_label.grid(row=0, column=1, padx=(4, 6))
+            count_label.grid(row=0, column=1, padx=(4, 0))
             self.boundary_count_labels[key] = count_label
-            ttk.Checkbutton(
-                row, text="推定", variable=self.boundary_estimated_vars[key],
-            ).grid(row=0, column=2, sticky="e")
 
-        ttk.Button(box, text="清除选中边线", command=self.clear_selected_boundary_edge).grid(
-            row=4, column=0, sticky="ew", pady=(4, 0))
-        ttk.Button(box, text="检查并预览四边范围", command=self.preview_boundary).grid(
-            row=5, column=0, sticky="ew", pady=(6, 0))
-        ttk.Button(box, text="查看场地图编号与方向", command=self.open_field_reference).grid(
-            row=6, column=0, sticky="ew", pady=(6, 0))
-        ttk.Checkbutton(
-            box, text="启用四边标定（关闭后使用旧模式）",
-            variable=self.boundary_enabled_var,
-            command=self._refresh_boundary_status,
-        ).grid(row=7, column=0, sticky="w", pady=(8, 0))
+        for row, label, action in (
+            (5, "清除选中边线", self.clear_selected_boundary_edge),
+            (6, "检查并预览四边范围", self.preview_boundary),
+            (7, "查看场地图编号与方向", self.open_field_reference),
+        ):
+            button = ttk.Button(box, text=label, command=action)
+            button.grid(row=row, column=0, sticky="ew", pady=(6, 0))
+            self.boundary_edit_widgets.append(button)
         ttk.Label(
             box, textvariable=self.boundary_status_var, wraplength=285,
             justify="left", foreground="#475569",
@@ -1083,68 +1273,100 @@ class AnnotationClient(tk.Tk):
         ttk.Label(
             panel,
             text="边线名称按场地坐标命名，不按画面上下左右命名。"
-                 "看不清的边线请标为“推定”；黄色虚线是按四边投影的球场线，"
+                 "黄色虚线是按四边投影的球场线，"
                  "请对照可见中线、禁区线核对方向与位置。",
             wraplength=300, justify="left", foreground="#475569",
         ).grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self._sync_boundary_controls()
         self._refresh_boundary_status()
+
+    def _sync_boundary_controls(self) -> None:
+        enabled = self.boundary_enabled_var.get()
+        for widget in getattr(self, "boundary_edit_widgets", []):
+            widget.state(["!disabled"] if enabled else ["disabled"])
+        if self.current_step.key == "field_boundary":
+            for widget_name in ("undo_button", "clear_step_button", "preview_step_button"):
+                widget = getattr(self, widget_name, None)
+                if widget is not None:
+                    widget.state(["!disabled"] if enabled else ["disabled"])
+            if hasattr(self, "save_step_button"):
+                self.save_step_button.configure(
+                    text="保存本步" if enabled else "保存旧模式")
+
+    def _on_boundary_mode_change(self) -> None:
+        self.boundary_preview_lines = False
+        self._sync_boundary_controls()
+        self._refresh_boundary_status()
+        self._refresh_step_list()
+        self._refresh_finish_summary()
+        self._redraw()
 
     def _build_marker_groups_panel(self, panel: ttk.Frame) -> None:
         box = ttk.LabelFrame(panel, text="器材分组设置", padding=8)
         box.grid(row=0, column=0, sticky="ew")
         box.columnconfigure(0, weight=1)
 
-        ttk.Label(box, text="器材组数（1–99 组）").grid(row=0, column=0, sticky="w")
+        ttk.Label(box, text="器材选填；无器材可直接保存并测量。",
+                  foreground="#475569", wraplength=280, justify="left").grid(
+                      row=0, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(box, text="器材组数（0–99 组）").grid(
+            row=1, column=0, sticky="w")
         count_row = ttk.Frame(box)
-        count_row.grid(row=1, column=0, sticky="ew", pady=(3, 10))
+        count_row.grid(row=2, column=0, sticky="ew", pady=(3, 10))
         count_row.columnconfigure(0, weight=1)
-        count_spin = ttk.Spinbox(count_row, from_=1, to=99,
+        count_spin = ttk.Spinbox(count_row, from_=0, to=99,
                                  textvariable=self.marker_group_count_var, width=8)
         count_spin.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         count_spin.bind("<Return>", lambda _event: self.apply_marker_group_count())
         ttk.Button(count_row, text="应用组数", command=self.apply_marker_group_count).grid(
             row=0, column=1, sticky="e")
 
-        ttk.Label(box, text="当前标注组").grid(row=2, column=0, sticky="w")
-        current_group_spin = ttk.Spinbox(box, from_=1, to=99,
-                                         textvariable=self.current_group, width=8,
-                                         command=self.select_marker_group)
-        current_group_spin.grid(row=3, column=0, sticky="ew", pady=(3, 10))
-        current_group_spin.bind("<Return>", lambda _event: self.select_marker_group())
-        current_group_spin.bind("<FocusOut>", lambda _event: self.select_marker_group())
+        ttk.Label(box, text="当前标注组").grid(row=3, column=0, sticky="w")
+        self.marker_current_group_spin = ttk.Spinbox(
+            box, from_=1, to=99, textvariable=self.current_group, width=8,
+            command=self.select_marker_group,
+        )
+        self.marker_current_group_spin.grid(row=4, column=0, sticky="ew", pady=(3, 10))
+        self.marker_current_group_spin.bind("<Return>", lambda _event: self.select_marker_group())
+        self.marker_current_group_spin.bind("<FocusOut>", lambda _event: self.select_marker_group())
 
         ttk.Label(box, text="当前组器材类型（可选择或自行输入）").grid(
-            row=4, column=0, sticky="w")
-        ttk.Combobox(
+            row=5, column=0, sticky="w")
+        self.marker_equipment_type_combo = ttk.Combobox(
             box,
             textvariable=self.marker_equipment_type_var,
             values=("未指定", "标志桶", "标志碟", "标志杆", "跨栏", "小球门", "敏捷梯", "其他"),
             state="normal",
-        ).grid(row=5, column=0, sticky="ew", pady=(3, 8))
+        )
+        self.marker_equipment_type_combo.grid(row=6, column=0, sticky="ew", pady=(3, 8))
 
-        ttk.Label(box, text="当前组训练形式").grid(row=6, column=0, sticky="w")
+        ttk.Label(box, text="当前组训练形式").grid(row=7, column=0, sticky="w")
         mode_row = ttk.Frame(box)
-        mode_row.grid(row=7, column=0, sticky="ew", pady=(3, 4))
+        mode_row.grid(row=8, column=0, sticky="ew", pady=(3, 4))
         mode_row.columnconfigure(0, weight=1)
         mode_row.columnconfigure(1, weight=1)
-        ttk.Radiobutton(
+        line_button = ttk.Radiobutton(
             mode_row, text="线型训练", variable=self.marker_layout_var,
             value="line", command=self._remember_marker_layout_mode,
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(
+        )
+        line_button.grid(row=0, column=0, sticky="w")
+        ring_button = ttk.Radiobutton(
             mode_row, text="环型训练", variable=self.marker_layout_var,
             value="ring", command=self._remember_marker_layout_mode,
-        ).grid(row=0, column=1, sticky="w")
+        )
+        ring_button.grid(row=0, column=1, sticky="w")
+        self.marker_layout_buttons = (line_button, ring_button)
         ttk.Label(
             box, text="环型会额外测量最后一点到第一点，建议至少标注 3 个点。",
             foreground="#475569", wraplength=280, justify="left",
-        ).grid(row=8, column=0, sticky="w", pady=(0, 8))
+        ).grid(row=9, column=0, sticky="w", pady=(0, 8))
 
         ttk.Button(box, text="新增一组器材", command=self.new_group).grid(
-            row=9, column=0, sticky="ew")
-        ttk.Label(box, text="每组至少标注一个点；保存后训练形式写入 config.yaml。",
+            row=10, column=0, sticky="ew")
+        ttk.Label(box, text="只保存已标点的组；空组不参与测量。",
                   foreground="#475569", wraplength=280, justify="left").grid(
-                      row=10, column=0, sticky="w", pady=(8, 0))
+                      row=11, column=0, sticky="w", pady=(8, 0))
+        self._sync_marker_group_controls()
 
     def _build_train_area_panel(self, panel: ttk.Frame) -> None:
         box = ttk.LabelFrame(panel, text="区域构成", padding=8)
@@ -1178,6 +1400,8 @@ class AnnotationClient(tk.Tk):
             row=2, column=0, sticky="ew", pady=(6, 0))
         ttk.Button(actions, text="打开结果目录", command=self.open_output_dir).grid(
             row=3, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(actions, text="打开器材测量目录", command=self.open_measurement_dir).grid(
+            row=4, column=0, sticky="ew", pady=(6, 0))
 
     # ------------------------------------------------------------------
     # 步骤切换
@@ -1185,7 +1409,7 @@ class AnnotationClient(tk.Tk):
 
     @property
     def current_step(self) -> StepDef:
-        return STEP_DEFS[self.current_step_index]
+        return self._active_steps()[self.current_step_index]
 
     def _on_step_listbox(self, _event=None) -> None:
         selection = self.step_listbox.curselection()
@@ -1196,11 +1420,10 @@ class AnnotationClient(tk.Tk):
         self._select_step(max(0, self.current_step_index - 1))
 
     def next_step(self) -> None:
-        # 四边模式可跳过旧关键点步骤；真正的必要条件在测量前按模式检查。
-        self._select_step(min(len(STEP_DEFS) - 1, self.current_step_index + 1))
+        self._select_step(min(len(self._active_steps()) - 1, self.current_step_index + 1))
 
     def _select_step(self, index: int) -> None:
-        self.current_step_index = max(0, min(index, len(STEP_DEFS) - 1))
+        self.current_step_index = max(0, min(index, len(self._active_steps()) - 1))
         step = self.current_step
         for key, panel in self.step_panels.items():
             if key == step.key:
@@ -1213,6 +1436,13 @@ class AnnotationClient(tk.Tk):
         if hasattr(self, "save_step_button"):
             savable = step.key not in ("setup", "finish")
             self.save_step_button.state(["!disabled"] if savable else ["disabled"])
+            self.save_step_button.configure(text="保存本步")
+        for widget_name in ("undo_button", "clear_step_button", "preview_step_button"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.state(["!disabled"])
+        if step.key == "field_boundary":
+            self._sync_boundary_controls()
         self.current_group.set(1)
         if step.key == "markers":
             self._sync_marker_group_controls()
@@ -1229,23 +1459,17 @@ class AnnotationClient(tk.Tk):
         if not hasattr(self, "finish_summary"):
             return
         lines = []
-        for i, step in enumerate(STEP_DEFS[:-1]):
+        for i, step in enumerate(self._active_steps()[:-1]):
             done = self._step_complete(step.key)
             icon = "✔" if done else ("△ 可选" if step.optional else "✘")
             lines.append(f"{icon}  {i + 1}. {step.title}")
         distortion = self._store_dir() / "distortion_params.json"
         lines.append("")
-        lines.append("畸变参数：" + ("已缓存（标注变化后自动清理）" if distortion.exists() else "将由主流程自动计算"))
-        boundary = self._step_save_path("field_boundary")
-        boundary_enabled = False
-        if boundary.exists():
-            try:
-                boundary_enabled = bool(json.loads(boundary.read_text(encoding="utf-8"))
-                                        .get("enabled", True))
-            except (OSError, ValueError, TypeError, AttributeError):
-                lines.append("场地边界：标定文件异常，请修复后运行")
-        if not any(line.startswith("场地边界：") for line in lines):
-            lines.append("场地边界：" + ("四边标定优先" if boundary_enabled else "旧模式"))
+        if self.boundary_enabled_var.get():
+            lines.append("畸变参数：四边模式不使用旧畸变参数")
+        else:
+            lines.append("畸变参数：" + ("已缓存（标注变化后自动清理）" if distortion.exists() else "将由主流程自动计算"))
+        lines.append("场地边界：" + ("四边标定" if self.boundary_enabled_var.get() else "旧模式"))
         self.finish_summary.configure(text="\n".join(lines))
 
     # ------------------------------------------------------------------
@@ -1253,14 +1477,44 @@ class AnnotationClient(tk.Tk):
     # ------------------------------------------------------------------
 
     def apply_setup(self) -> None:
+        if self._measurement_running:
+            messagebox.showwarning("项目设置", "测量正在运行，请完成后再修改项目配置。")
+            return
+        selected_step_key = self.current_step.key
         new_name = self.camera_name_var.get().strip()
         if not new_name:
             messagebox.showwarning("项目设置", "相机名称不能为空。")
             return
-        video = Path(self.video_path_var.get().strip())
-        if not video.exists():
-            messagebox.showwarning("项目设置", f"视频文件不存在：\n{video}")
-            return
+        video_text = self.video_path_var.get().strip()
+        video = Path(video_text).resolve() if video_text else None
+        if self.media_kind == "image":
+            if not self.source_path or not self.source_path.exists():
+                messagebox.showwarning("项目设置", "当前图片不存在，请重新导入。")
+                return
+            if video:
+                frame = self._read_video_frame(video, 0)
+                if frame is None or frame.shape[:2] != (self.image_h, self.image_w):
+                    messagebox.showwarning(
+                        "项目设置", "关联的视频无法读取，或分辨率与当前图片不一致。")
+                    return
+        else:
+            if not video:
+                messagebox.showwarning("项目设置", "请先导入视频。")
+                return
+            try:
+                identity = self._media_file_identity(video)
+            except OSError:
+                messagebox.showwarning("项目设置", f"视频文件不存在：\n{video}")
+                return
+            if (self.source_path != video or
+                    (self.media_identity is not None and identity != self.media_identity)):
+                frame = self._read_video_frame(video, 0)
+                if frame is None:
+                    messagebox.showwarning("项目设置", "新视频无法读取首帧。")
+                    return
+                if not self._activate_new_media(video, frame, "video"):
+                    return
+                selected_step_key = "setup"
         new_root = self.store_root_var.get().strip() or "store"
         root_path = Path(new_root)
         if not root_path.is_absolute():
@@ -1277,33 +1531,49 @@ class AnnotationClient(tk.Tk):
         config_changed = config_name != self.pitch_config.__class__.__name__
         self.camera_name = new_name
         self.store_root = new_root
-        self.source_path = video
+        if self.media_kind == "video":
+            self.source_path = video
 
         self.pitch_config = self._load_pitch_config(config_name)
         self._refresh_vertex_options()
 
         self._write_config_yaml()
         self._refresh_store_dir_hint()
-        frame = self._read_video_frame(video, self.frame_index.get())
+        if name_changed or root_changed or config_changed:
+            self._reset_annotation_state()
+        frame = (self._read_image(self.source_path) if self.media_kind == "image"
+                 else self._read_video_frame(video, self.frame_index.get()))
         if frame is not None:
             self.set_frame(frame)
         if name_changed or root_changed or config_changed:
             self._load_existing_annotations()
-        self._refresh_step_list()
-        self._redraw()
+        visible_keys = {step.key for step in self._active_steps()}
+        self._select_step_by_key(
+            selected_step_key if selected_step_key in visible_keys else "field_boundary")
         if self._keypoint_geometry_warning:
             self.status.set("⚠ " + self._keypoint_geometry_warning)
         else:
             self.status.set(f"配置已保存：相机 {self.camera_name}，场地 {config_name}")
 
-    def _write_config_yaml(self) -> None:
-        video = Path(self.video_path_var.get().strip() or self._default_video_path())
+    def _write_config_yaml(self, *, save_boundary_mode: bool = False) -> None:
+        video_text = self.video_path_var.get().strip()
+        video = Path(video_text).resolve() if video_text else None
         data = self._load_config()
-        data["dir_path"] = str(video.parent)
-        data["video_name"] = video.name
+        data["dir_path"] = str(video.parent) if video else ""
+        data["video_name"] = video.name if video else ""
         data["CAMERA_NAME"] = self.camera_name
         data["config"] = self.selected_pitch_config.get()
         data["store_dir"] = self.store_root
+        data["store_base_dir"] = self.store_base_root
+        data["isolated_calibration_session"] = self.isolated_calibration_session
+        data["annotation_media_kind"] = self.media_kind
+        data["annotation_media_path"] = str(self.source_path) if self.source_path else ""
+        data["annotation_media_identity"] = self.media_identity
+        if save_boundary_mode:
+            saved_modes = data.get("four_boundary_enabled_by_camera")
+            saved_modes = dict(saved_modes) if isinstance(saved_modes, dict) else {}
+            saved_modes[self.camera_name] = bool(self.boundary_enabled_var.get())
+            data["four_boundary_enabled_by_camera"] = saved_modes
         data.setdefault("MCS_NAME", None)
         source_indices = measurement_group_source_indices(self.marker_groups)
         sync_measurement_group_configs(
@@ -1315,6 +1585,7 @@ class AnnotationClient(tk.Tk):
         data.setdefault("enable_orientation", True)
         with (self.project_dir / "config.yaml").open("w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+        self.config_data = data
         self._config_source_indices = source_indices
 
     # ------------------------------------------------------------------
@@ -1363,15 +1634,19 @@ class AnnotationClient(tk.Tk):
 
     def _refresh_boundary_status(self) -> None:
         if hasattr(self, "boundary_count_labels"):
-            for key in BOUNDARY_KEYS:
+            for key in BOUNDARY_UI_ORDER:
                 self.boundary_count_labels[key].configure(
                     text=f"{len(self.boundary_edges[key])}/2")
+        if not self.boundary_enabled_var.get():
+            self.boundary_status_var.set(
+                "已切换旧模式；四边标注操作不可用。请完成关键点、横向和纵向直线标注。"
+                "如已有四边文件，点“保存旧模式”停用该文件。")
+            return
         selected = self.boundary_edge_var.get()
         count = len(self.boundary_edges.get(selected, []))
         if all(len(self.boundary_edges[key]) == 2 for key in BOUNDARY_KEYS):
-            mode = "启用四边标定" if self.boundary_enabled_var.get() else "使用旧模式"
             self.boundary_status_var.set(
-                f"四条边线已标齐。请检查轮廓，再点“保存本步”选择{mode}。")
+                "四条边线已标齐。请检查轮廓，再点“保存本步”。")
         else:
             self.boundary_status_var.set(
                 f"当前：{BOUNDARY_LABELS.get(selected, selected)}，已标 {count}/2 点。"
@@ -1383,17 +1658,23 @@ class AnnotationClient(tk.Tk):
                 "请确认是同一固定机位且构图未变。")
 
     def _build_boundary_data(self) -> Dict[str, Any]:
+        saved_path = self._step_save_path("field_boundary")
+        if not self.boundary_enabled_var.get() and saved_path.exists():
+            # 关闭四边模式只停用已保存的几何，不写入尚未保存的画布修改。
+            previous = load_boundary(
+                saved_path, self.camera_name, self.pitch_config,
+                (self.image_w, self.image_h),
+            )
+            return {
+                **previous, "enabled": False,
+                "edges": {
+                    key: {field: value for field, value in previous["edges"][key].items()
+                          if field != "estimated"}
+                    for key in BOUNDARY_KEYS
+                },
+            }
         if not all(len(self.boundary_edges[key]) == 2 for key in BOUNDARY_KEYS):
-            # 停用已经保存的四边模式不应要求重新画完内存中的线，
-            # 但仍保留旧几何以便之后重新启用。
-            saved_path = self._step_save_path("field_boundary")
-            if not self.boundary_enabled_var.get() and saved_path.exists():
-                previous = load_boundary(
-                    saved_path, self.camera_name, self.pitch_config,
-                    (self.image_w, self.image_h),
-                )
-                return {**previous, "enabled": False}
-            remaining = [BOUNDARY_LABELS[key] for key in BOUNDARY_KEYS
+            remaining = [BOUNDARY_LABELS[key] for key in BOUNDARY_UI_ORDER
                          if len(self.boundary_edges[key]) != 2]
             raise ValueError("请先给四条边线各标记两个点；未完成：" + "、".join(remaining))
         data = {
@@ -1408,7 +1689,6 @@ class AnnotationClient(tk.Tk):
             "edges": {
                 key: {
                     "points": [[int(x), int(y)] for x, y in self.boundary_edges[key]],
-                    "estimated": bool(self.boundary_estimated_vars[key].get()),
                 }
                 for key in BOUNDARY_KEYS
             },
@@ -1422,6 +1702,8 @@ class AnnotationClient(tk.Tk):
         return data
 
     def preview_boundary(self) -> None:
+        if not self.boundary_enabled_var.get():
+            return
         if not all(len(self.boundary_edges[key]) == 2 for key in BOUNDARY_KEYS):
             messagebox.showwarning("四条边线标定", "请先给四条边线各标记两个点，再预览。")
             return
@@ -1432,9 +1714,7 @@ class AnnotationClient(tk.Tk):
             self.boundary_status_var.set(f"无法预览：{exc}")
             messagebox.showwarning("四条边线标定", str(exc))
             return
-        estimated = [BOUNDARY_LABELS[key] for key in BOUNDARY_KEYS
-                     if self.boundary_estimated_vars[key].get()]
-        suffix = "；推定线：" + "、".join(estimated) if estimated else ""
+        suffix = ""
         if self.keypoints:
             image_points = np.asarray(
                 [item.img_coord for item in self.keypoints], dtype=np.float32,
@@ -1451,10 +1731,12 @@ class AnnotationClient(tk.Tk):
             f"已计算四角和球场线投影{suffix}。"
             "几何通过不代表真实边线正确，请核对可见的中线、禁区线与方向后保存。")
         self.boundary_preview_lines = True
-        self.status.set("边线轮廓已预览；尚未保存，不影响旧模式")
+        self.status.set("边线轮廓已预览；运行测量前请保存本步")
         self._redraw()
 
     def clear_selected_boundary_edge(self) -> None:
+        if not self.boundary_enabled_var.get():
+            return
         key = self.boundary_edge_var.get()
         if key not in self.boundary_edges:
             return
@@ -1616,10 +1898,14 @@ class AnnotationClient(tk.Tk):
             vertex_index = self.selected_vertex.get()
             self.keypoints = [a for a in self.keypoints if a.vertex_index != vertex_index]
             self.keypoints.append(KeypointAnnotation(vertex_index=vertex_index, img_coord=point))
+            self.keypoint_source_name = ""
             self.status.set(f"已标注关键点 {vertex_index}: {point}")
             self.next_unannotated_vertex()
             self._refresh_keypoint_progress()
         elif key == "field_boundary":
+            if not self.boundary_enabled_var.get():
+                self.status.set("四边标定已关闭；请在旧模式步骤标注。")
+                return
             edge_key = self.boundary_edge_var.get()
             edge_points = self.boundary_edges[edge_key]
             if len(edge_points) >= 2:
@@ -1634,6 +1920,9 @@ class AnnotationClient(tk.Tk):
             self.train_area_points.append(point)
             self.status.set(f"已添加自定义点 V{len(self.train_area_points)}: {point}")
         else:
+            if key == "markers" and not self.marker_groups:
+                self.status.set("当前为 0 组器材；如需标注，请先点“新增一组器材”。")
+                return
             group_idx = self.ensure_group() - 1
             groups = self._active_group_store()
             if groups is None:
@@ -1663,12 +1952,26 @@ class AnnotationClient(tk.Tk):
             self.status.set(f"第 {index + 1} 组已设为{mode}；保存本步后生效。")
 
     def _sync_marker_group_controls(self) -> None:
-        self.marker_group_count_var.set(str(len(self.marker_groups)))
+        count = len(self.marker_groups)
+        self.marker_group_count_var.set(str(count))
+        for widget in (
+            getattr(self, "marker_current_group_spin", None),
+            getattr(self, "marker_equipment_type_combo", None),
+            *getattr(self, "marker_layout_buttons", ()),
+        ):
+            if widget is not None:
+                widget.state(["!disabled"] if count else ["disabled"])
+        if count == 0:
+            self.current_group.set(0)
+            self._active_marker_type_index = -1
+            self.marker_equipment_type_var.set(DEFAULT_EQUIPMENT_TYPE)
+            self.marker_layout_var.set("line")
+            return
         try:
             group_number = int(self.current_group.get())
         except (tk.TclError, ValueError):
             group_number = 1
-        group_number = max(1, min(group_number, len(self.marker_groups)))
+        group_number = max(1, min(group_number, count))
         self.current_group.set(group_number)
         self._active_marker_type_index = group_number - 1
         self.marker_equipment_type_var.set(self.marker_equipment_types[self._active_marker_type_index])
@@ -1678,10 +1981,10 @@ class AnnotationClient(tk.Tk):
     def apply_marker_group_count(self) -> None:
         try:
             target = int(self.marker_group_count_var.get().strip())
-            if not 1 <= target <= 99:
+            if not 0 <= target <= 99:
                 raise ValueError
         except ValueError:
-            messagebox.showwarning("器材组数", "请输入 1–99 之间的整数。")
+            messagebox.showwarning("器材组数", "请输入 0–99 之间的整数。")
             self.marker_group_count_var.set(str(len(self.marker_groups)))
             return
 
@@ -1710,13 +2013,19 @@ class AnnotationClient(tk.Tk):
             selected_group = int(self.current_group.get())
         except (tk.TclError, ValueError):
             selected_group = 1
-        self.current_group.set(min(selected_group, target))
+        self.current_group.set(min(selected_group, target) if target else 0)
         self._sync_marker_group_controls()
         self._refresh_step_list()
         self._redraw()
-        self.status.set(f"已设置 {target} 组器材；请为每组选择类型并在画面中标点。")
+        self.status.set(
+            "已设置 0 组器材；可直接跳过此步骤。" if target == 0
+            else f"已设置 {target} 组器材；请为每组选择类型并在画面中标点。"
+        )
 
     def select_marker_group(self) -> None:
+        if not self.marker_groups:
+            self._sync_marker_group_controls()
+            return
         try:
             group_number = int(self.current_group.get())
             if not 1 <= group_number <= 99:
@@ -1735,6 +2044,11 @@ class AnnotationClient(tk.Tk):
         self._redraw()
 
     def ensure_group(self) -> int:
+        if self.current_step.key == "markers" and not self.marker_groups:
+            # Selecting a step or clicking the canvas must not create an
+            # equipment group behind an explicit 0-group setting.
+            self.current_group.set(0)
+            return 0
         try:
             group_number = max(1, min(99, int(self.current_group.get())))
         except (tk.TclError, ValueError):
@@ -1764,6 +2078,7 @@ class AnnotationClient(tk.Tk):
             self.current_group.set(len(groups))
             if self.current_step.key == "markers":
                 self._sync_marker_group_controls()
+                self.status.set(f"已新增第 {len(groups)} 组器材，请在画面中标点。")
         self._refresh_step_list()
         self._redraw()
 
@@ -1772,9 +2087,12 @@ class AnnotationClient(tk.Tk):
         if key == "keypoints":
             if self.keypoints:
                 removed = self.keypoints.pop()
+                self.keypoint_source_name = ""
                 self.status.set(f"已撤销关键点 {removed.vertex_index}")
                 self._refresh_keypoint_progress()
         elif key == "field_boundary":
+            if not self.boundary_enabled_var.get():
+                return
             edge_points = self.boundary_edges[self.boundary_edge_var.get()]
             if edge_points:
                 edge_points.pop()
@@ -1798,8 +2116,11 @@ class AnnotationClient(tk.Tk):
             if self.keypoints and not messagebox.askyesno("清空", "确定清空全部关键点标注？"):
                 return
             self.keypoints.clear()
+            self.keypoint_source_name = ""
             self._refresh_keypoint_progress()
         elif key == "field_boundary":
+            if not self.boundary_enabled_var.get():
+                return
             if any(self.boundary_edges.values()) and not messagebox.askyesno(
                 "清空", "确定清空内存中的四条边线？已保存文件不会删除。"
             ):
@@ -1825,14 +2146,12 @@ class AnnotationClient(tk.Tk):
     # ------------------------------------------------------------------
 
     def _video_points_to_pitch(self, points: List[Point]) -> np.ndarray:
-        boundary_path = self._step_save_path("field_boundary")
-        if any(self.boundary_edges.values()) or boundary_path.exists():
+        if self.boundary_enabled_var.get():
             boundary = self._build_boundary_data()
-            if boundary["enabled"]:
-                H, _quad = compute_boundary_homography(boundary)
-                return cv2.perspectiveTransform(
-                    np.asarray(points, dtype=np.float32).reshape(-1, 1, 2), H,
-                ).reshape(-1, 2)
+            H, _quad = compute_boundary_homography(boundary)
+            return cv2.perspectiveTransform(
+                np.asarray(points, dtype=np.float32).reshape(-1, 1, 2), H,
+            ).reshape(-1, 2)
         if len(self.keypoints) < 4:
             raise ValueError("需要先完成至少 4 个球场关键点标注")
         from tools.transform import compute_transform_matrix, video_pixel_to_pitch
@@ -1931,6 +2250,30 @@ class AnnotationClient(tk.Tk):
             "才选择“是”覆盖。否则请选择“否”，或更换相机名称保存新标注。",
         )
 
+    def _archive_invalid_boundary_for_legacy(self, path: Path, error: ValueError) -> bool:
+        """Keep an unusable boundary file recoverable before switching to legacy mode."""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = path.with_name(f"{path.stem}.disabled-backup-{stamp}{path.suffix}")
+        suffix = 1
+        while backup.exists():
+            backup = path.with_name(
+                f"{path.stem}.disabled-backup-{stamp}-{suffix}{path.suffix}")
+            suffix += 1
+        if not messagebox.askyesno(
+            "备份无效的四边标定",
+            f"已有四边标定文件与当前相机、场地或画面不匹配：\n{error}\n\n"
+            f"旧模式无法读取该文件。是否将它备份到：\n{backup}\n\n"
+            "原内容会保留在备份中，活动路径移空后才能使用旧模式。",
+        ):
+            return False
+        try:
+            path.rename(backup)
+        except OSError as exc:
+            messagebox.showwarning("备份失败", f"无法备份 {path}：{exc}")
+            return False
+        self.status.set(f"已备份无效四边标定：{backup}")
+        return True
+
     def save_current_step(self) -> None:
         if not self._require_applied_pitch_config():
             return
@@ -1938,9 +2281,19 @@ class AnnotationClient(tk.Tk):
         path = self._step_save_path(key)
         if path is None:
             return
+        if key == "field_boundary" and not self.boundary_enabled_var.get() and not path.exists():
+            self._write_config_yaml(save_boundary_mode=True)
+            self.status.set("已选择旧模式；没有四边标定文件需要停用。")
+            self._refresh_step_list()
+            return
         try:
             data = self._build_step_data(key)
         except ValueError as exc:
+            if key == "field_boundary" and not self.boundary_enabled_var.get() and path.exists():
+                if self._archive_invalid_boundary_for_legacy(path, exc):
+                    self._write_config_yaml(save_boundary_mode=True)
+                    self._refresh_step_list()
+                return
             messagebox.showwarning("保存", str(exc))
             return
         if key == "keypoints" and not self._confirm_replacing_mismatched_keypoints(path):
@@ -1950,6 +2303,7 @@ class AnnotationClient(tk.Tk):
                 path, data,
                 self._derived_cache_paths() if key in ("keypoints", "manual_h", "manual_v")
                 else (self._store_dir() / "camera_info.json",) if key == "field_boundary"
+                else self._marker_result_paths() if key == "markers"
                 else (),
             )
         except OSError as exc:
@@ -1959,22 +2313,26 @@ class AnnotationClient(tk.Tk):
             self._write_config_yaml()
         if key == "keypoints":
             self._keypoint_geometry_warning = None
+            self.keypoint_source_name = str(data.get("source") or "")
         if key == "field_boundary":
+            self._write_config_yaml(save_boundary_mode=True)
             self.boundary_source_name = str(data.get("source") or "")
             self._refresh_boundary_status()
         self.status.set(f"已保存 {path}")
         self._refresh_step_list()
         if key == "markers":
             self._warn_unsaved_marker_groups()
+            self._refresh_finish_summary()
 
     def _warn_unsaved_marker_groups(self) -> None:
         empty_numbers = [str(index + 1) for index, group in enumerate(self.marker_groups) if not group]
-        if empty_numbers:
-            messagebox.showwarning(
-                "器材分组尚未完成",
-                "第 " + "、".join(empty_numbers) + " 组尚未标点，未保存。"
-                "请切换到这些组，在画面中标注后再次保存。",
-            )
+        if not empty_numbers:
+            return
+        if not any(self.marker_groups):
+            self.status.set(self.status.get() + "；未标注器材，已按无器材训练保存")
+        else:
+            self.status.set(self.status.get() + "；空白器材组 "
+                            + "、".join(empty_numbers) + " 已忽略")
 
     def _build_step_data(self, key: str) -> Dict[str, Any]:
         if key == "keypoints":
@@ -2042,20 +2400,29 @@ class AnnotationClient(tk.Tk):
         if not self._require_applied_pitch_config():
             return False
         boundary_path = self._step_save_path("field_boundary")
-        if any(self.boundary_edges.values()) or boundary_path.exists():
+        boundary_enabled = self.boundary_enabled_var.get()
+        if boundary_enabled or boundary_path.exists():
             try:
                 self._build_boundary_data()
             except ValueError as exc:
-                messagebox.showwarning(
-                    "四条边线未保存",
-                    f"{exc}\n\n请完成四边标定，或关闭四边标定后再保存。",
-                )
-                self._select_step(STEP_KEYS.index("field_boundary"))
-                return False
+                if not boundary_enabled:
+                    if not self._archive_invalid_boundary_for_legacy(boundary_path, exc):
+                        return False
+                else:
+                    messagebox.showwarning(
+                        "四条边线未保存",
+                        f"{exc}\n\n请完成四边标定，或关闭四边标定后再保存。",
+                    )
+                    self._select_step_by_key("field_boundary")
+                    return False
         self._write_config_yaml()
         saved, skipped = [], []
-        for key in ("keypoints", "manual_h", "manual_v", "field_boundary",
-                    "train_area", "markers"):
+        steps_to_save = (
+            (("field_boundary",) if boundary_enabled else ("keypoints", "manual_h", "manual_v"))
+            + (("field_boundary",) if not boundary_enabled and boundary_path.exists() else ())
+            + ("train_area", "markers")
+        )
+        for key in steps_to_save:
             path = self._step_save_path(key)
             try:
                 data = self._build_step_data(key)
@@ -2065,7 +2432,7 @@ class AnnotationClient(tk.Tk):
                         "四条边线未保存",
                         f"{exc}\n\n已有边线文件未被更改；请完成并保存，或关闭四边标定后再运行。",
                     )
-                    self._select_step(STEP_KEYS.index("field_boundary"))
+                    self._select_step_by_key("field_boundary")
                     return False
                 skipped.append(key)
                 continue
@@ -2076,6 +2443,7 @@ class AnnotationClient(tk.Tk):
                     path, data,
                     self._derived_cache_paths() if key in ("keypoints", "manual_h", "manual_v")
                     else (self._store_dir() / "camera_info.json",) if key == "field_boundary"
+                    else self._marker_result_paths() if key == "markers"
                     else (),
                 )
             except OSError as exc:
@@ -2083,6 +2451,7 @@ class AnnotationClient(tk.Tk):
                 return False
             if key == "keypoints":
                 self._keypoint_geometry_warning = None
+                self.keypoint_source_name = str(data.get("source") or "")
             if key == "field_boundary":
                 self.boundary_source_name = str(data.get("source") or "")
             saved.append(path.name)
@@ -2096,12 +2465,23 @@ class AnnotationClient(tk.Tk):
             self.status.set(self.status.get() + "；跳过：" + "、".join(names[k] for k in skipped))
         if "markers.json" in saved:
             self._warn_unsaved_marker_groups()
+            self._refresh_finish_summary()
+        if saved:
+            self._write_config_yaml(save_boundary_mode=True)
         return bool(saved)
 
     def _derived_cache_paths(self) -> Tuple[Path, ...]:
         return (
             self._store_dir() / "distortion_params.json",
             self._store_dir() / "camera_info.json",
+        )
+
+    def _marker_result_paths(self) -> Tuple[Path, ...]:
+        output_dir = self._manual_dir()
+        return (
+            output_dir / "coordinates.json",
+            output_dir / "measurement_report.txt",
+            output_dir / "visualization.jpg",
         )
 
     def clear_derived_cache(self) -> None:
@@ -2134,6 +2514,8 @@ class AnnotationClient(tk.Tk):
     def save_preview(self) -> None:
         if self.current_step.key in ("setup", "finish"):
             messagebox.showinfo("生成预览图", "请先切换到具体的标注步骤。")
+            return
+        if self.current_step.key == "field_boundary" and not self.boundary_enabled_var.get():
             return
         default_path = self._default_preview_path()
         default_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2250,14 +2632,15 @@ class AnnotationClient(tk.Tk):
                 self._draw_point(x, y, label, self.POINT_COLORS[i % len(self.POINT_COLORS)])
             return
         if key == "field_boundary":
+            if not self.boundary_enabled_var.get():
+                return
             for name in BOUNDARY_KEYS:
                 points = self.boundary_edges[name]
                 color = BOUNDARY_COLORS[name]
                 if len(points) == 2:
                     p0 = self.image_to_canvas(*points[0])
                     p1 = self.image_to_canvas(*points[1])
-                    options = {"dash": (7, 4)} if self.boundary_estimated_vars[name].get() else {}
-                    self.canvas.create_line(*p0, *p1, fill=color, width=3, **options)
+                    self.canvas.create_line(*p0, *p1, fill=color, width=3)
                 for index, point in enumerate(points):
                     x, y = self.image_to_canvas(*point)
                     self._draw_point(x, y, f"{name[:1].upper()}{index + 1}", color)
@@ -2329,11 +2712,10 @@ class AnnotationClient(tk.Tk):
                 self.annotation_list.insert(tk.END, f"{ann.vertex_index}: {label} -> {ann.img_coord}")
             return
         if key == "field_boundary":
-            for name in BOUNDARY_KEYS:
+            for name in BOUNDARY_UI_ORDER:
                 points = self.boundary_edges[name]
-                estimated = " · 推定" if self.boundary_estimated_vars[name].get() else ""
                 self.annotation_list.insert(
-                    tk.END, f"{BOUNDARY_LABELS[name]}：{len(points)}/2{estimated}")
+                    tk.END, f"{BOUNDARY_LABELS[name]}：{len(points)}/2")
                 for index, point in enumerate(points):
                     self.annotation_list.insert(tk.END, f"  点 {index + 1}: {point}")
             return
@@ -2466,44 +2848,86 @@ class AnnotationClient(tk.Tk):
     # ------------------------------------------------------------------
 
     def open_output_dir(self) -> None:
+        target = self._store_dir()
+        if not target.exists():
+            messagebox.showinfo("打开结果目录", "相机标定结果目录尚不存在，请先保存标注或运行测量。")
+            return
+        open_path_in_file_manager(str(target))
+
+    def open_measurement_dir(self) -> None:
         target = self._manual_dir()
         if not target.exists():
-            target = self._store_dir()
-        if not target.exists():
-            messagebox.showinfo("打开结果目录", "结果目录尚不存在，请先保存标注或运行测量。")
+            messagebox.showinfo("打开器材测量目录", "器材测量目录尚不存在，请先保存器材标注或运行测量。")
             return
         open_path_in_file_manager(str(target))
 
     def save_and_run_measurement(self) -> None:
-        boundary_path = self._step_save_path("field_boundary")
-        boundary_mode = False
-        if any(self.boundary_edges.values()) or boundary_path.exists():
+        if self._measurement_running:
+            messagebox.showwarning("运行测量", "测量正在运行，请等待当前任务完成。")
+            return
+        video_text = self.video_path_var.get().strip()
+        if not video_text:
+            messagebox.showwarning(
+                "运行测量", "当前任务尚未关联视频。请在“项目设置”中选择"
+                "与标注图片分辨率一致的测量视频，并应用配置。")
+            self._select_step_by_key("setup")
+            return
+        video_frame = self._read_video_frame(Path(video_text), 0)
+        if video_frame is None:
+            messagebox.showwarning("运行测量", "测量视频无法读取，请重新选择视频。")
+            self._select_step_by_key("setup")
+            return
+        if self.media_kind == "image" and video_frame.shape[:2] != (self.image_h, self.image_w):
+            messagebox.showwarning("运行测量", "测量视频与标注图片的分辨率不同，不能复用标注坐标。")
+            self._select_step_by_key("setup")
+            return
+        boundary_mode = bool(self.boundary_enabled_var.get())
+        boundary_data = None
+        if boundary_mode:
             try:
-                boundary_mode = bool(self._build_boundary_data()["enabled"])
+                boundary_data = self._build_boundary_data()
             except ValueError as exc:
                 messagebox.showwarning("运行测量", f"四条边线标定尚未完成：{exc}")
-                self._select_step(STEP_KEYS.index("field_boundary"))
+                self._select_step_by_key("field_boundary")
                 return
         if not boundary_mode and not self._step_complete("keypoints"):
             messagebox.showwarning("运行测量", "关键点未完成（至少 4 个），无法计算单应矩阵。")
-            self._select_step(STEP_KEYS.index("keypoints"))
+            self._select_step_by_key("keypoints")
             return
-        empty_numbers = [str(index + 1) for index, group in enumerate(self.marker_groups) if not group]
-        if empty_numbers:
-            messagebox.showwarning(
-                "运行测量",
-                "第 " + "、".join(empty_numbers) + " 组器材尚未标点。"
-                "请先完成全部器材组标注，再运行测量。",
+        for key, title in (("manual_h", "横向直线标注"), ("manual_v", "纵向直线标注")):
+            if not boundary_mode and not self._step_complete(key):
+                messagebox.showwarning("运行测量", f"旧模式必选步骤“{title}”尚未完成，请先标注并保存。")
+                self._select_step_by_key(key)
+                return
+        quality_messages = []
+        try:
+            # Use the annotations currently visible in the editor, not old JSON
+            # files. A cancelled warning must not save or start the measurement.
+            quality_boundary = boundary_data if boundary_mode else None
+            if quality_boundary and self.boundary_source_name:
+                quality_boundary = {**quality_boundary, "source": self.boundary_source_name}
+            quality_issues = inspect_calibration_quality(
+                pitch_config=self.pitch_config,
+                image_size=(self.image_w, self.image_h),
+                keypoints=[(item.vertex_index, item.img_coord) for item in self.keypoints],
+                field_boundary=quality_boundary,
+                source_name=self.source_path.name if self.source_path else None,
+                keypoint_source_name=self.keypoint_source_name or None,
             )
-            self._select_step(STEP_KEYS.index("markers"))
-            self.current_group.set(int(empty_numbers[0]))
-            self.select_marker_group()
-            return
-        if not boundary_mode and not (self._step_complete("manual_h") and self._step_complete("manual_v")):
-            if not messagebox.askyesno(
-                "运行测量",
-                "横向/纵向直线未标注完整，畸变标定精度会受影响。\n仍要继续吗？",
+            quality_messages.extend(issue.message for issue in quality_issues)
+        except Exception as exc:
+            # A preflight failure is also visible to the operator, but does
+            # not silently turn a quality warning into a hard stop.
+            quality_messages.append(f"标定质量检查未完成：{exc}")
+        if quality_messages:
+            details = "\n".join(f"{index}. {message}" for index, message in enumerate(quality_messages, 1))
+            if not messagebox.askokcancel(
+                "标定质量提醒",
+                "检测到以下可能影响效果图的异常：\n\n"
+                f"{details}\n\n"
+                "点击“确定”继续生成效果图；点击“取消”返回检查标注。",
             ):
+                self.status.set("已取消生成，请检查标定提示后再试。")
                 return
         if not self.save_all_default():
             messagebox.showwarning("运行测量", "没有可保存的标注，已取消。")
@@ -2512,9 +2936,14 @@ class AnnotationClient(tk.Tk):
         log_window, log_text = self._open_measurement_log_window()
         log_text.insert(tk.END, f"相机：{self.camera_name}\n")
         log_text.insert(tk.END, f"标志物文件：{self._step_save_path('markers')}\n")
+        if quality_messages:
+            log_text.insert(tk.END, "标定质量提醒（已确认继续）：\n")
+            for index, message in enumerate(quality_messages, 1):
+                log_text.insert(tk.END, f"  {index}. {message}\n")
         log_text.insert(tk.END, "开始运行测量流程...\n\n")
         log_text.configure(state="disabled")
         self.status.set("测量运行中…")
+        self._measurement_running = True
         worker = threading.Thread(target=self._run_measurement_worker,
                                   args=(log_window, log_text), daemon=True)
         worker.start()
@@ -2553,7 +2982,7 @@ class AnnotationClient(tk.Tk):
             if result.stderr:
                 output += "\n[错误输出]\n" + result.stderr
             if result.returncode == 0:
-                output += f"\n测量完成。结果目录：store/manual/{self.camera_name}\n"
+                output += f"\n测量完成。结果目录：{self._manual_dir()}\n"
                 status = "测量完成"
             else:
                 output += f"\n测量失败，退出码：{result.returncode}\n"
@@ -2563,6 +2992,7 @@ class AnnotationClient(tk.Tk):
             status = "测量启动失败"
 
         def update_ui() -> None:
+            self._measurement_running = False
             if log_window.winfo_exists():
                 self._append_measurement_log(log_text, output)
             self.status.set(status)

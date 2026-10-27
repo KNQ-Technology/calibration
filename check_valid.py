@@ -1,6 +1,26 @@
 import numpy as np
 
-def is_valid(points, pitch_to_pixel, pixel_to_pitch, w, h):
+
+def orientation_sign_from_quad(quad):
+    """Return the handedness of TL/TR/BR/BL image corners of a pitch.
+
+    The four-edge calibration already validates that these corners form a
+    non-degenerate convex quadrilateral. Both signs are legitimate camera
+    views; the sign is a property of the calibrated mapping, not a fixed
+    requirement that the camera be on one side of the field.
+    """
+    corners = np.asarray(quad, dtype=np.float64)
+    if corners.shape != (4, 2) or not np.isfinite(corners).all():
+        raise ValueError("Invalid four-edge pitch corners")
+    top = corners[1] - corners[0]
+    left = corners[3] - corners[0]
+    signed_area = top[0] * left[1] - top[1] * left[0]
+    if not np.isfinite(signed_area) or abs(signed_area) <= 1e-12:
+        raise ValueError("Degenerate four-edge pitch corners")
+    return 1 if signed_area > 0 else -1
+
+
+def is_valid(points, pitch_to_pixel, pixel_to_pitch, w, h, orientation_sign=1):
     """
     Checks the validity of a set of points based on coordinate transformations and geometric constraints.
     Parameters
@@ -15,13 +35,17 @@ def is_valid(points, pitch_to_pixel, pixel_to_pitch, w, h):
         Width of the image (in pixels).
     h : int or float
         Height of the image (in pixels).
+    orientation_sign : int, optional
+        Expected local pitch-to-image orientation (+1 or -1). The legacy
+        calibration keeps its historical +1 default; four-edge calibration
+        passes the sign established by its validated quadrilateral.
     Returns
     -------
     mask : np.ndarray, shape (N,)
         Boolean array indicating which points are valid according to the following criteria:
         - The pixel coordinates are within the image boundaries.
         - The round-trip transformation error (pitch -> pixel -> pitch) is less than 5 units.
-        - The local transformation preserves orientation (Jacobian determinant is positive).
+        - The local transformation has the expected, non-zero orientation.
     """
     import os
     import yaml
@@ -29,6 +53,9 @@ def is_valid(points, pitch_to_pixel, pixel_to_pitch, w, h):
     config_path = os.path.join(root_path, "config.yaml")
     with open(config_path, 'r', encoding='utf-8') as f:
         config_dict = yaml.safe_load(f)
+
+    if orientation_sign not in (-1, 1):
+        raise ValueError("orientation_sign must be +1 or -1")
 
     # 将点从球场坐标转换为像素坐标
     points = np.array(points, dtype=np.float32).reshape(-1, 2)  # 确保输入是正确的形状
@@ -51,11 +78,12 @@ def is_valid(points, pitch_to_pixel, pixel_to_pitch, w, h):
                                                      pixel_points[2 * N:, :],
                                                      pitch_points,
                                                      points)):
+        local_area = ((pixel_pt_x[0] - pixel_pt[0]) * (pixel_pt_y[1] - pixel_pt[1])
+                      - (pixel_pt_x[1] - pixel_pt[1]) * (pixel_pt_y[0] - pixel_pt[0]))
         if 0 <= pixel_pt[0] < w and 0 <= pixel_pt[1] < h \
             and (np.linalg.norm(pitch_pt - pt) < config_dict['reprojection_eps']) \
-            and ((not config_dict['enable_orientation']) or 
-                (pixel_pt_x[0] - pixel_pt[0]) * (pixel_pt_y[1] - pixel_pt[1]) \
-              > (pixel_pt_x[1] - pixel_pt[1]) * (pixel_pt_y[0] - pixel_pt[0])):
+            and ((not config_dict['enable_orientation']) or
+                 (np.isfinite(local_area) and orientation_sign * local_area > 0)):
             mask[i] = True
 
     return mask
