@@ -25,6 +25,7 @@ def draw_pitch(
 
     # 判断是否为半场配置
     is_half_pitch = isinstance(config, (HalfPitchConfiguration, HalfQingYuanConfiguration, HalfWuChuanConfiguration, HalfWuChuanYiZhongConfiguration))
+    is_right_half = is_half_pitch and getattr(config, "is_right_half", False)
 
     # 2. 创建画布
     pitch_image = np.ones(
@@ -33,12 +34,18 @@ def draw_pitch(
         dtype=np.uint8
     ) * np.array(background_color.as_bgr(), dtype=np.uint8)
 
+    # 右半场的场地底图应与左半场严格成 180° 旋转关系。
+    # 先用左半场坐标绘制，再整体旋转；其他叠加层仍使用右半场的顶点坐标。
+    vertices = config.vertices
+    if is_right_half:
+        vertices = [(config.length - x, config.width - y) for x, y in vertices]
+
     # 3. 绘制线段 (基于 config.edges 和 config.vertices)
     for start, end in config.edges:
-        point1 = (int(config.vertices[start - 1][0] * scale) + padding,
-                  int(config.vertices[start - 1][1] * scale) + padding)
-        point2 = (int(config.vertices[end - 1][0] * scale) + padding,
-                  int(config.vertices[end - 1][1] * scale) + padding)
+        point1 = (int(vertices[start - 1][0] * scale) + padding,
+                  int(vertices[start - 1][1] * scale) + padding)
+        point2 = (int(vertices[end - 1][0] * scale) + padding,
+                  int(vertices[end - 1][1] * scale) + padding)
         cv2.line(
             img=pitch_image,
             pt1=point1,
@@ -106,6 +113,8 @@ def draw_pitch(
             thickness=-1
         )
 
+    if is_right_half:
+        return cv2.rotate(pitch_image, cv2.ROTATE_180)
     return pitch_image
 
 

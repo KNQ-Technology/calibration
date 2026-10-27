@@ -8,7 +8,7 @@ import ast
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import unittest
 
 
@@ -27,7 +27,7 @@ def _definitions(*method_names):
     methods = [node for node in owner.body
                if isinstance(node, ast.FunctionDef) and node.name in method_names]
     assert len(methods) == len(method_names)
-    namespace = {"Any": Any, "Dict": Dict, "Path": Path,
+    namespace = {"Any": Any, "Dict": Dict, "Optional": Optional, "Path": Path,
                  "tk": SimpleNamespace(END="end")}
     exec(compile(ast.Module(body=constants + methods, type_ignores=[]),
                  str(SOURCE), "exec"), namespace)
@@ -40,6 +40,9 @@ class _Variable:
 
     def get(self):
         return self.value
+
+    def set(self, value):
+        self.value = value
 
 
 class _Listbox:
@@ -98,6 +101,118 @@ class BoundaryUiOrderTests(unittest.TestCase):
         self.assertEqual(listbox.items, [
             "左端线：0/2", "上边线：0/2", "右端线：0/2", "下边线：0/2",
         ])
+
+    def test_second_point_selects_next_unfinished_edge_and_wraps(self):
+        _, _, namespace = _definitions(
+            "_next_unfinished_boundary_edge", "on_canvas_click")
+        edges = {key: [] for key in namespace["BOUNDARY_KEYS"]}
+        app = SimpleNamespace(
+            canvas_to_image=lambda x, y: (x, y),
+            current_step=SimpleNamespace(key="field_boundary"),
+            boundary_enabled_var=_Variable(True),
+            boundary_edge_var=_Variable("left"),
+            boundary_edges=edges,
+            boundary_preview_lines=True,
+            status=_Variable(""),
+            _refresh_boundary_status=lambda: None,
+            _refresh_step_list=lambda: None,
+            _redraw=lambda: None,
+        )
+        app._next_unfinished_boundary_edge = lambda current: (
+            namespace["_next_unfinished_boundary_edge"](app, current))
+        click = namespace["on_canvas_click"]
+
+        click(app, SimpleNamespace(x=10, y=20))
+        self.assertEqual(app.boundary_edge_var.get(), "left")
+        click(app, SimpleNamespace(x=30, y=40))
+        self.assertEqual(app.boundary_edge_var.get(), "top")
+        self.assertEqual(len(edges["left"]), 2)
+        self.assertIn("已自动切换到上边线", app.status.get())
+        self.assertFalse(app.boundary_preview_lines)
+
+        # A manually chosen later edge still advances in left/top/right/bottom
+        # order, skipping complete edges and wrapping to any remaining one.
+        app.boundary_edge_var.set("right")
+        click(app, SimpleNamespace(x=50, y=60))
+        click(app, SimpleNamespace(x=70, y=80))
+        self.assertEqual(app.boundary_edge_var.get(), "bottom")
+        click(app, SimpleNamespace(x=90, y=100))
+        click(app, SimpleNamespace(x=110, y=120))
+        self.assertEqual(app.boundary_edge_var.get(), "top")
+        click(app, SimpleNamespace(x=130, y=140))
+        click(app, SimpleNamespace(x=150, y=160))
+        self.assertEqual(app.boundary_edge_var.get(), "top")
+        self.assertIn("四条边线均已标满", app.status.get())
+
+    def test_completed_edge_can_be_selected_cleared_and_marked_again(self):
+        _, _, namespace = _definitions(
+            "_next_unfinished_boundary_edge", "on_canvas_click",
+            "clear_selected_boundary_edge")
+        edges = {key: [] for key in namespace["BOUNDARY_KEYS"]}
+        edges["left"] = [(10, 20), (30, 40)]
+        app = SimpleNamespace(
+            canvas_to_image=lambda x, y: (x, y),
+            current_step=SimpleNamespace(key="field_boundary"),
+            boundary_enabled_var=_Variable(True),
+            boundary_edge_var=_Variable("left"),
+            boundary_edges=edges,
+            boundary_preview_lines=False,
+            status=_Variable(""),
+            _refresh_boundary_status=lambda: None,
+            _refresh_step_list=lambda: None,
+            _redraw=lambda: None,
+        )
+        app._next_unfinished_boundary_edge = lambda current: (
+            namespace["_next_unfinished_boundary_edge"](app, current))
+        click = namespace["on_canvas_click"]
+
+        click(app, SimpleNamespace(x=50, y=60))
+        self.assertEqual(edges["left"], [(10, 20), (30, 40)])
+        self.assertEqual(app.boundary_edge_var.get(), "left")
+        self.assertIn("先点“清除选中边线”", app.status.get())
+
+        namespace["clear_selected_boundary_edge"](app)
+        click(app, SimpleNamespace(x=50, y=60))
+        click(app, SimpleNamespace(x=70, y=80))
+        self.assertEqual(edges["left"], [(50, 60), (70, 80)])
+        self.assertEqual(app.boundary_edge_var.get(), "top")
+
+    def test_undo_after_auto_advance_reverts_previous_edge(self):
+        _, _, namespace = _definitions(
+            "_next_unfinished_boundary_edge", "on_canvas_click", "undo",
+            "_on_boundary_edge_selected")
+        edges = {key: [] for key in namespace["BOUNDARY_KEYS"]}
+        app = SimpleNamespace(
+            canvas_to_image=lambda x, y: (x, y),
+            current_step=SimpleNamespace(key="field_boundary"),
+            boundary_enabled_var=_Variable(True),
+            boundary_edge_var=_Variable("left"),
+            boundary_edges=edges,
+            boundary_preview_lines=False,
+            _boundary_last_advanced_from=None,
+            status=_Variable(""),
+            _refresh_boundary_status=lambda: None,
+            _refresh_step_list=lambda: None,
+            _redraw=lambda: None,
+        )
+        app._next_unfinished_boundary_edge = lambda current: (
+            namespace["_next_unfinished_boundary_edge"](app, current))
+        click = namespace["on_canvas_click"]
+        click(app, SimpleNamespace(x=10, y=20))
+        click(app, SimpleNamespace(x=30, y=40))
+        self.assertEqual(app.boundary_edge_var.get(), "top")
+
+        namespace["undo"](app)
+        self.assertEqual(edges["left"], [(10, 20)])
+        self.assertEqual(app.boundary_edge_var.get(), "left")
+
+        click(app, SimpleNamespace(x=30, y=40))
+        self.assertEqual(app.boundary_edge_var.get(), "top")
+        app.boundary_edge_var.set("right")
+        namespace["_on_boundary_edge_selected"](app)
+        namespace["undo"](app)
+        self.assertEqual(edges["left"], [(10, 20), (30, 40)])
+        self.assertEqual(app.boundary_edge_var.get(), "right")
 
 
 if __name__ == "__main__":

@@ -155,6 +155,7 @@ class AnnotationMediaImportTests(unittest.TestCase):
         app = _app(ns, "save_and_run_measurement",
                    media_kind="image", source_path=Path("/new/frame.jpg"),
                    _measurement_running=False, video_path_var=_Var(""),
+                   _confirm_measurement_retry=lambda: True,
                    boundary_enabled_var=_Var(True),
                    _select_step_by_key=lambda key: self.assertEqual(key, "setup"),
                    _build_boundary_data=lambda: self.fail("image reached calibration preflight"),
@@ -175,6 +176,7 @@ class AnnotationMediaImportTests(unittest.TestCase):
                    boundary_source_name="old.mp4", boundary_preview_lines=True,
                    train_area_points=[old_point], train_area_region=[[1, 2], [3, 4], [5, 6]],
                    train_area_tokens=_Var("1, 2, V1"),
+                   _saved_preview_paths={"train_area": Path("/old/train_area_preview.jpg")},
                    marker_groups=[[old_point]], marker_equipment_types=["old"],
                    marker_group_closed=[True], marker_group_count_var=_Var("1"),
                    marker_equipment_type_var=_Var("old"), marker_layout_var=_Var("ring"),
@@ -195,6 +197,7 @@ class AnnotationMediaImportTests(unittest.TestCase):
         self.assertFalse(app.train_area_points)
         self.assertFalse(app.train_area_region)
         self.assertFalse(app.train_area_tokens.get())
+        self.assertFalse(app._saved_preview_paths)
         self.assertFalse(any(app.marker_groups))
         self.assertEqual(app.frame_index.get(), 0)
         self.assertEqual(app.current_step_index, 0)

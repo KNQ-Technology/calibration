@@ -344,17 +344,50 @@ class CameraFOVCalculator:
         if pitch_points.shape != (len(image_points), 2):
             return None
 
+        # A centre-line sample can cross the homography's perspective horizon.
+        # Points on opposite sides project to separate branches; joining them
+        # can make the final point fold back onto the near anchor and hide the
+        # direction arrow. Keep only the continuous branch nearest the bottom
+        # of the image (the ground-view side).
+        # In four-edge mode the homography receives raw image points, so its
+        # denominator gives an exact horizon test. In the legacy lens-corrected
+        # mode the input is first undistorted; use the projected-path reversal
+        # check below instead of applying this test to the wrong coordinates.
+        denominators = None
+        if getattr(self, "distortion_params", None) is None:
+            denominators = image_points @ self.H[2, :2] + self.H[2, 2]
+            finite_denominators = denominators[np.isfinite(denominators)]
+            if not len(finite_denominators):
+                return None
+            denominator_tolerance = np.max(np.abs(finite_denominators)) * 1e-9
+            near_denominator = denominators[0]
+            if not np.isfinite(near_denominator) or abs(near_denominator) <= denominator_tolerance:
+                return None
+            near_sign = np.sign(near_denominator)
+
         # Keep the diagram marker inside the field border, without pretending
         # that an out-of-field ground projection is the camera's true position.
         margin = min(pitch_length, pitch_width) * 0.03
         bounds = (margin, pitch_length - margin, margin, pitch_width - margin)
         clipped_segments = []
-        for start, end in zip(pitch_points[:-1], pitch_points[1:]):
+        previous_delta = None
+        for index, (start, end) in enumerate(zip(pitch_points[:-1], pitch_points[1:])):
+            if denominators is not None:
+                pair = denominators[index:index + 2]
+                if (not np.isfinite(pair).all() or
+                        np.any(pair * near_sign <= denominator_tolerance)):
+                    break
             if not (np.isfinite(start).all() and np.isfinite(end).all()):
-                continue
+                break
+            delta = end - start
+            if previous_delta is not None and np.dot(previous_delta, delta) < 0:
+                break
+            previous_delta = delta
             clipped = self._clip_segment_to_pitch(start, end, bounds)
             if clipped is not None:
                 clipped_segments.append(clipped)
+            elif clipped_segments:
+                break
 
         if not clipped_segments:
             return None

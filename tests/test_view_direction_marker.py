@@ -40,7 +40,7 @@ class MarkerHarness:
     def __init__(self, homography):
         self.h = 100
         self.w = 100
-        self.H = np.asarray(homography, dtype=np.float32)
+        self.H = np.asarray(homography, dtype=np.float64)
 
     def _project_points(self, image_points):
         return cv2.perspectiveTransform(
@@ -73,6 +73,26 @@ class ViewDirectionMarkerTests(unittest.TestCase):
         anchor, forward = MarkerHarness(homography).get_view_direction_marker(100, 100)
         np.testing.assert_allclose(anchor, [50, 97], atol=1e-4)
         np.testing.assert_allclose(forward, [0, -1], atol=1e-4)
+
+    def test_horizon_crossing_keeps_near_continuous_branch(self):
+        # A steep half-pitch view puts the perspective horizon between the
+        # last two centre-column samples. Joining points across that horizon
+        # can fold the far end back onto the near anchor and hide the arrow.
+        homography = [
+            [-0.5711432564575831, 0.4161743419221724, -55.21570846195375],
+            [-0.6597400214327566, -15.216582209562366, 7444.399082505429],
+            [2.1279487938405644e-06, -0.002442437426189365, 1.0],
+        ]
+        calculator = MarkerHarness(homography)
+        calculator.h, calculator.w = 1080, 1920
+        marker = calculator.get_view_direction_marker(4750, 6000)
+        self.assertIsNotNone(marker)
+        anchor, forward = marker
+        self.assertTrue(np.isfinite(anchor).all() and np.isfinite(forward).all())
+        self.assertGreater(anchor[0], 0)
+        self.assertGreater(anchor[1], 5000)
+        np.testing.assert_allclose(np.linalg.norm(forward), 1.0, atol=1e-6)
+        self.assertGreater(np.dot(forward, np.array([2375, 3000]) - anchor), 0)
 
     def test_non_overlapping_and_singular_projection_do_not_draw_marker(self):
         translated = [[1, 0, 0], [0, 1, 200], [0, 0, 1]]

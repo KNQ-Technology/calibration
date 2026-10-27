@@ -154,6 +154,11 @@ from field_boundary import (
     load_boundary,
     validate_boundary_data,
 )
+from field_reference import (
+    orientation_hint,
+    render_numbered_pitch,
+    resolve_reference_configuration,
+)
 from calibration_quality import inspect_calibration_quality
 import soccer
 
@@ -261,6 +266,31 @@ BOUNDARY_LABELS = {
 BOUNDARY_COLORS = {
     "top": "#22c55e", "right": "#38bdf8",
     "bottom": "#f59e0b", "left": "#f472b6",
+}
+
+# 仅用于界面显示；config.yaml 和标定数据仍使用原有配置类名。
+PITCH_CONFIG_LABELS = {
+    "GaoWuConfiguration": "高屋小学 · 全场",
+    "HalfGaoWuConfiguration": "高屋小学 · 左半场",
+    "RightHalfGaoWuConfiguration": "高屋小学 · 右半场",
+    "EliteU12Configuration": "精英队 U12 · 全场",
+    "HalfEliteU12Configuration": "精英队 U12 · 左半场",
+    "RightHalfEliteU12Configuration": "精英队 U12 · 右半场",
+    "EliteU15Configuration": "精英队 U15 · 全场",
+    "HalfEliteU15Configuration": "精英队 U15 · 左半场",
+    "RightHalfEliteU15Configuration": "精英队 U15 · 右半场",
+    "PuGongYingU11Configuration": "蒲公英 U11 · 全场",
+    "HalfPuGongYingU11Configuration": "蒲公英 U11 · 左半场",
+    "RightHalfPuGongYingU11Configuration": "蒲公英 U11 · 右半场",
+    "QingYuanConfiguration": "清源小学 · 全场",
+    "HalfQingYuanConfiguration": "清源小学 · 左半场",
+    "WuChuanConfiguration": "吴川 · 全场",
+    "HalfWuChuanConfiguration": "吴川 · 左半场",
+    "WuChuanYiZhongConfiguration": "吴川一中 · 全场",
+    "HalfWuChuanYiZhongConfiguration": "吴川一中 · 左半场",
+    "SoccerPitchConfiguration": "标准球场 · 全场",
+    "HalfPitchConfiguration": "标准球场 · 左半场",
+    "RightHalfPitchConfiguration": "标准球场 · 右半场",
 }
 
 
@@ -384,8 +414,13 @@ class AnnotationClient(tk.Tk):
         self.project_dir = Path(__file__).resolve().parent
         self.config_data = self._load_config()
         self.pitch_config_names = self._get_pitch_config_names()
-        initial_config = self.config_data.get("config", "QingYuanConfiguration")
+        initial_config = self.config_data.get("config") or self.pitch_config_names[0]
         self.selected_pitch_config = tk.StringVar(value=initial_config)
+        self.pitch_config_label_to_name = {
+            PITCH_CONFIG_LABELS.get(name, name): name for name in self.pitch_config_names
+        }
+        self.selected_pitch_config_label = tk.StringVar(
+            value=PITCH_CONFIG_LABELS.get(initial_config, initial_config))
         self.pitch_config = self._load_pitch_config(initial_config)
         self.camera_name = self.config_data.get("CAMERA_NAME") or "camera1"
 
@@ -401,6 +436,14 @@ class AnnotationClient(tk.Tk):
         self.media_kind = self.config_data.get("annotation_media_kind", "video")
         self.media_identity = self.config_data.get("annotation_media_identity")
         self._measurement_running = False
+        self._measurement_worker: Optional[threading.Thread] = None
+        self._measurement_process: Optional[subprocess.Popen] = None
+        self._measurement_cancel: Optional[threading.Event] = None
+        self._measurement_result: Optional[Tuple[int, str, str]] = None
+        self._measurement_run_id = 0
+        self._measurement_restart_pending = False
+        self._measurement_log_window = None
+        self._measurement_log_text = None
         self.frame_bgr = self._load_default_frame()
         self.image_h, self.image_w = self.frame_bgr.shape[:2]
 
@@ -417,6 +460,7 @@ class AnnotationClient(tk.Tk):
         self.manual_v_groups: List[List[Point]] = [[]]
         self.boundary_edges: Dict[str, List[Point]] = {key: [] for key in BOUNDARY_KEYS}
         self.boundary_edge_var = tk.StringVar(value=BOUNDARY_UI_ORDER[0])
+        self._boundary_last_advanced_from: Optional[str] = None
         self.boundary_enabled_var = tk.BooleanVar(value=True)
         self.boundary_status_var = tk.StringVar(value="四条边线各标记两个点后可保存")
         self.boundary_preview_lines = False
@@ -424,6 +468,7 @@ class AnnotationClient(tk.Tk):
         self.train_area_points: List[Point] = []       # 视频画面自定义点 V1..Vn
         self.train_area_region: List[List[float]] = []  # 球场坐标区域点 (cm)
         self.train_area_tokens = tk.StringVar(value="")
+        self._saved_preview_paths: Dict[str, Path] = {}
 
         self.current_step_index = 0
         self.current_group = tk.IntVar(value=0)
@@ -468,24 +513,43 @@ class AnnotationClient(tk.Tk):
             return yaml.safe_load(f) or {}
 
     def _get_pitch_config_names(self) -> List[str]:
+        # Hide retired choices from the picker only. Their classes and saved
+        # configuration names remain loadable for existing projects.
+        hidden_names = {
+            "QingYuanConfiguration", "HalfQingYuanConfiguration",
+            "WuChuanConfiguration", "HalfWuChuanConfiguration",
+            "WuChuanYiZhongConfiguration", "HalfWuChuanYiZhongConfiguration",
+        }
         names = []
         for name in dir(soccer):
             config_cls = getattr(soccer, name)
-            if name.endswith("Configuration") and isinstance(config_cls, type):
+            if (name.endswith("Configuration") and isinstance(config_cls, type)
+                    and name not in hidden_names):
                 names.append(name)
         preferred = [
-            "QingYuanConfiguration",
-            "HalfQingYuanConfiguration",
-            "WuChuanConfiguration",
-            "HalfWuChuanConfiguration",
-            "WuChuanYiZhongConfiguration",
-            "HalfWuChuanYiZhongConfiguration",
+            "GaoWuConfiguration",
+            "HalfGaoWuConfiguration",
+            "RightHalfGaoWuConfiguration",
+            "EliteU12Configuration",
+            "HalfEliteU12Configuration",
+            "RightHalfEliteU12Configuration",
+            "EliteU15Configuration",
+            "HalfEliteU15Configuration",
+            "RightHalfEliteU15Configuration",
+            "PuGongYingU11Configuration",
+            "HalfPuGongYingU11Configuration",
+            "RightHalfPuGongYingU11Configuration",
             "SoccerPitchConfiguration",
             "HalfPitchConfiguration",
+            "RightHalfPitchConfiguration",
         ]
         ordered = [name for name in preferred if name in names]
         ordered.extend(sorted(name for name in names if name not in ordered))
         return ordered
+
+    def _on_pitch_config_selected(self, _event=None) -> None:
+        label = self.selected_pitch_config_label.get()
+        self.selected_pitch_config.set(self.pitch_config_label_to_name[label])
 
     def _load_pitch_config(self, class_name: str) -> Any:
         config_cls = getattr(soccer, class_name, soccer.QingYuanConfiguration)
@@ -584,11 +648,13 @@ class AnnotationClient(tk.Tk):
         self.manual_h_groups = [[]]
         self.manual_v_groups = [[]]
         self.boundary_edges = {key: [] for key in BOUNDARY_KEYS}
+        self._boundary_last_advanced_from = None
         self.boundary_source_name = ""
         self.boundary_preview_lines = False
         self.train_area_points = []
         self.train_area_region = []
         self.train_area_tokens.set("")
+        self._saved_preview_paths.clear()
         self.marker_groups = []
         self.marker_equipment_types = []
         self.marker_group_closed = []
@@ -1100,6 +1166,12 @@ class AnnotationClient(tk.Tk):
         self.preview_step_button = ttk.Button(self.common_actions, text="生成预览图", command=self.save_preview)
         self.preview_step_button.grid(
             row=1, column=1, sticky="ew", pady=(8, 0), padx=(4, 0))
+        self.open_step_result_button = ttk.Button(
+            self.common_actions, text="打开结果目录",
+            command=lambda: self.open_step_result_dir(self.current_step.key))
+        self.open_step_result_button.grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.open_step_result_button.grid_remove()
 
         # 标注列表
         list_box = ttk.LabelFrame(self.side, text="标注列表", padding=8)
@@ -1138,11 +1210,12 @@ class AnnotationClient(tk.Tk):
         ttk.Label(box, text="场地配置").grid(row=9, column=0, sticky="w")
         self.pitch_config_combo = ttk.Combobox(
             box,
-            textvariable=self.selected_pitch_config,
-            values=self.pitch_config_names,
+            textvariable=self.selected_pitch_config_label,
+            values=[PITCH_CONFIG_LABELS.get(name, name) for name in self.pitch_config_names],
             state="readonly",
         )
         self.pitch_config_combo.grid(row=10, column=0, sticky="ew", pady=(0, 8))
+        self.pitch_config_combo.bind("<<ComboboxSelected>>", self._on_pitch_config_selected)
 
         ttk.Button(box, text="应用并保存配置 (config.yaml)",
                    command=self.apply_setup).grid(row=11, column=0, sticky="ew")
@@ -1250,7 +1323,7 @@ class AnnotationClient(tk.Tk):
             edge_radio = ttk.Radiobutton(
                 row, text=BOUNDARY_LABELS[key], value=key,
                 variable=self.boundary_edge_var,
-                command=self._refresh_boundary_status,
+                command=self._on_boundary_edge_selected,
             )
             edge_radio.grid(row=0, column=0, sticky="w")
             self.boundary_edit_widgets.append(edge_radio)
@@ -1294,12 +1367,18 @@ class AnnotationClient(tk.Tk):
                     text="保存本步" if enabled else "保存旧模式")
 
     def _on_boundary_mode_change(self) -> None:
+        self._boundary_last_advanced_from = None
         self.boundary_preview_lines = False
         self._sync_boundary_controls()
         self._refresh_boundary_status()
         self._refresh_step_list()
         self._refresh_finish_summary()
         self._redraw()
+
+    def _on_boundary_edge_selected(self) -> None:
+        """A manual selection overrides the last automatic advance."""
+        self._boundary_last_advanced_from = None
+        self._refresh_boundary_status()
 
     def _build_marker_groups_panel(self, panel: ttk.Frame) -> None:
         box = ttk.LabelFrame(panel, text="器材分组设置", padding=8)
@@ -1441,6 +1520,7 @@ class AnnotationClient(tk.Tk):
             widget = getattr(self, widget_name, None)
             if widget is not None:
                 widget.state(["!disabled"])
+        self._sync_step_result_button()
         if step.key == "field_boundary":
             self._sync_boundary_controls()
         self.current_group.set(1)
@@ -1454,6 +1534,12 @@ class AnnotationClient(tk.Tk):
             self._refresh_boundary_status()
         self._refresh_step_list()
         self._redraw()
+
+    def _sync_step_result_button(self) -> None:
+        if self.current_step.key in ("field_boundary", "train_area", "markers"):
+            self.open_step_result_button.grid()
+        else:
+            self.open_step_result_button.grid_remove()
 
     def _refresh_finish_summary(self) -> None:
         if not hasattr(self, "finish_summary"):
@@ -1657,6 +1743,17 @@ class AnnotationClient(tk.Tk):
                 self.boundary_status_var.get() + "\n注意：边线取自另一视频/图片；"
                 "请确认是同一固定机位且构图未变。")
 
+    def _next_unfinished_boundary_edge(self, current: str) -> Optional[str]:
+        """Advance in the displayed order, wrapping past completed edges."""
+        if current not in BOUNDARY_UI_ORDER:
+            return None
+        start = BOUNDARY_UI_ORDER.index(current)
+        for offset in range(1, len(BOUNDARY_UI_ORDER)):
+            candidate = BOUNDARY_UI_ORDER[(start + offset) % len(BOUNDARY_UI_ORDER)]
+            if len(self.boundary_edges[candidate]) < 2:
+                return candidate
+        return None
+
     def _build_boundary_data(self) -> Dict[str, Any]:
         saved_path = self._step_save_path("field_boundary")
         if not self.boundary_enabled_var.get() and saved_path.exists():
@@ -1741,6 +1838,7 @@ class AnnotationClient(tk.Tk):
         if key not in self.boundary_edges:
             return
         self.boundary_edges[key].clear()
+        self._boundary_last_advanced_from = None
         self.boundary_preview_lines = False
         self._refresh_boundary_status()
         self._refresh_step_list()
@@ -1782,8 +1880,24 @@ class AnnotationClient(tk.Tk):
         # 中圈
         if hasattr(self.pitch_config, "centre_circle_radius"):
             r = float(self.pitch_config.centre_circle_radius) * s
-            cx, cy = pt((self.pitch_config.length / 2, self.pitch_config.width / 2))
-            c.create_oval(cx - r, cy - r, cx + r, cy + r, outline=line_color)
+            is_half = isinstance(self.pitch_config, (
+                soccer.HalfPitchConfiguration,
+                soccer.HalfQingYuanConfiguration,
+                soccer.HalfWuChuanConfiguration,
+                soccer.HalfWuChuanYiZhongConfiguration,
+            ))
+            if is_half:
+                is_right = getattr(self.pitch_config, "is_right_half", False)
+                centre_x = 0 if is_right else self.pitch_config.length
+                cx, cy = pt((centre_x, self.pitch_config.width / 2))
+                c.create_arc(
+                    cx - r, cy - r, cx + r, cy + r,
+                    start=270 if is_right else 90, extent=180,
+                    style=tk.ARC, outline=line_color,
+                )
+            else:
+                cx, cy = pt((self.pitch_config.length / 2, self.pitch_config.width / 2))
+                c.create_oval(cx - r, cy - r, cx + r, cy + r, outline=line_color)
         # 场地线（edges 为 1-based 顶点编号）
         for edge in getattr(self.pitch_config, "edges", []):
             a, b = edge[0] - 1, edge[1] - 1
@@ -1906,6 +2020,7 @@ class AnnotationClient(tk.Tk):
             if not self.boundary_enabled_var.get():
                 self.status.set("四边标定已关闭；请在旧模式步骤标注。")
                 return
+            self._boundary_last_advanced_from = None
             edge_key = self.boundary_edge_var.get()
             edge_points = self.boundary_edges[edge_key]
             if len(edge_points) >= 2:
@@ -1913,8 +2028,19 @@ class AnnotationClient(tk.Tk):
                 return
             edge_points.append(point)
             self.boundary_preview_lines = False
-            self.status.set(
-                f"{BOUNDARY_LABELS[edge_key]}：已标 {len(edge_points)}/2 点 {point}")
+            if len(edge_points) == 2:
+                next_key = self._next_unfinished_boundary_edge(edge_key)
+                if next_key is None:
+                    self.status.set("四条边线均已标满两个点，请检查并预览四边范围。")
+                else:
+                    self.boundary_edge_var.set(next_key)
+                    self._boundary_last_advanced_from = edge_key
+                    self.status.set(
+                        f"{BOUNDARY_LABELS[edge_key]}已完成，"
+                        f"已自动切换到{BOUNDARY_LABELS[next_key]}。")
+            else:
+                self.status.set(
+                    f"{BOUNDARY_LABELS[edge_key]}：已标 {len(edge_points)}/2 点 {point}")
             self._refresh_boundary_status()
         elif key == "train_area":
             self.train_area_points.append(point)
@@ -2093,11 +2219,18 @@ class AnnotationClient(tk.Tk):
         elif key == "field_boundary":
             if not self.boundary_enabled_var.get():
                 return
-            edge_points = self.boundary_edges[self.boundary_edge_var.get()]
+            edge_key = self.boundary_edge_var.get()
+            edge_points = self.boundary_edges[edge_key]
+            if not edge_points and self._boundary_last_advanced_from:
+                edge_key = self._boundary_last_advanced_from
+                edge_points = self.boundary_edges[edge_key]
+                self.boundary_edge_var.set(edge_key)
             if edge_points:
                 edge_points.pop()
                 self.boundary_preview_lines = False
-                self._refresh_boundary_status()
+                self.status.set(f"已撤销{BOUNDARY_LABELS[edge_key]}的最后一个点。")
+            self._boundary_last_advanced_from = None
+            self._refresh_boundary_status()
         elif key == "train_area":
             if self.train_area_points:
                 self.train_area_points.pop()
@@ -2126,6 +2259,7 @@ class AnnotationClient(tk.Tk):
             ):
                 return
             self.boundary_edges = {name: [] for name in BOUNDARY_KEYS}
+            self._boundary_last_advanced_from = None
             self.boundary_preview_lines = False
             self._refresh_boundary_status()
         elif key == "train_area":
@@ -2529,6 +2663,7 @@ class AnnotationClient(tk.Tk):
             return
         preview = self._render_preview_image()
         self._write_image(Path(path), preview)
+        self._saved_preview_paths[self.current_step.key] = Path(path)
         self.status.set(f"预览图已保存 {path}")
 
     def _render_preview_image(self):
@@ -2744,41 +2879,40 @@ class AnnotationClient(tk.Tk):
     # 场地参考图
     # ------------------------------------------------------------------
 
-    def _reference_images(self) -> List[Tuple[str, Path]]:
-        ref_dir = self.project_dir / "images" / "calibration_reference"
-        return [
-            ("吴川半场", ref_dir / "01_吴川半场.png"),
-            ("清源半场", ref_dir / "02_清源半场.png"),
-            ("清源全场", ref_dir / "03_清源全场.png"),
-            ("完整说明", ref_dir / "04_完整说明.png"),
-        ]
-
     def open_field_reference(self) -> None:
-        references = [(name, path) for name, path in self._reference_images() if path.exists()]
-        if not references:
-            messagebox.showwarning("场地图编号", "没有找到场地标定参考图。")
+        selected_name = self.selected_pitch_config.get()
+        try:
+            config, not_applied = resolve_reference_configuration(
+                selected_name, self.pitch_config)
+            reference_image = render_numbered_pitch(config)
+        except (ValueError, AttributeError, TypeError) as exc:
+            messagebox.showerror("场地图编号", f"无法生成当前场地图：{exc}")
             return
 
+        display_name = PITCH_CONFIG_LABELS.get(selected_name, selected_name)
+        direction = orientation_hint(config)
+        if not_applied:
+            direction += " 当前仅预览所选配置；请先“应用并保存配置”再继续标注。"
+
         window = tk.Toplevel(self)
-        window.title("场地标定图编号参考")
+        window.title(f"场地图编号与方向 · {display_name}")
         window.geometry("1100x820")
         window.columnconfigure(0, weight=1)
         window.rowconfigure(1, weight=1)
 
-        selected = tk.StringVar(value=references[0][0])
         zoom_value = tk.DoubleVar(value=1.0)
-        original_image: Dict[str, Optional[Image.Image]] = {"image": None}
         photo_ref: Dict[str, Optional[ImageTk.PhotoImage]] = {"photo": None}
 
         toolbar = ttk.Frame(window, padding=(10, 8))
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(0, weight=1)
-        combo = ttk.Combobox(toolbar, textvariable=selected,
-                             values=[name for name, _ in references], state="readonly")
-        combo.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Label(toolbar, text=display_name, font=(UI_FONT, 13, "bold")).grid(
+            row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Button(toolbar, text="放大", command=lambda: set_zoom(zoom_value.get() * 1.25)).grid(row=0, column=1, padx=3)
         ttk.Button(toolbar, text="缩小", command=lambda: set_zoom(zoom_value.get() / 1.25)).grid(row=0, column=2, padx=3)
         ttk.Button(toolbar, text="适应窗口", command=lambda: fit_to_window()).grid(row=0, column=3, padx=3)
+        ttk.Label(toolbar, text=direction, wraplength=1000, justify="left").grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         frame = ttk.Frame(window)
         frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
@@ -2794,9 +2928,7 @@ class AnnotationClient(tk.Tk):
         hbar.grid(row=1, column=0, sticky="ew")
 
         def draw_image() -> None:
-            image = original_image["image"]
-            if image is None:
-                return
+            image = reference_image
             scale = max(0.2, min(zoom_value.get(), 6.0))
             width = max(1, int(image.width * scale))
             height = max(1, int(image.height * scale))
@@ -2812,20 +2944,12 @@ class AnnotationClient(tk.Tk):
             draw_image()
 
         def fit_to_window() -> None:
-            image = original_image["image"]
-            if image is None:
-                return
+            image = reference_image
             canvas.update_idletasks()
             available_w = max(100, canvas.winfo_width() - 20)
             available_h = max(100, canvas.winfo_height() - 20)
             zoom_value.set(min(available_w / image.width, available_h / image.height, 1.0))
             draw_image()
-
-        def show_selected(_event=None) -> None:
-            ref_path = dict(references)[selected.get()]
-            original_image["image"] = Image.open(ref_path).convert("RGB")
-            zoom_value.set(1.0)
-            fit_to_window()
 
         def on_wheel(event) -> str:
             if event.delta > 0:
@@ -2834,14 +2958,13 @@ class AnnotationClient(tk.Tk):
                 set_zoom(zoom_value.get() / 1.15)
             return "break"
 
-        combo.bind("<<ComboboxSelected>>", show_selected)
         canvas.bind("<MouseWheel>", on_wheel)
         canvas.bind("<ButtonPress-1>", lambda e: canvas.scan_mark(e.x, e.y))
         canvas.bind("<B1-Motion>", lambda e: canvas.scan_dragto(e.x, e.y, gain=1))
         window.bind("<Control-plus>", lambda _e: set_zoom(zoom_value.get() * 1.25))
         window.bind("<Control-minus>", lambda _e: set_zoom(zoom_value.get() / 1.25))
         window.bind("<Control-0>", lambda _e: fit_to_window())
-        window.after(100, show_selected)
+        window.after(100, fit_to_window)
 
     # ------------------------------------------------------------------
     # 测量流程
@@ -2861,9 +2984,19 @@ class AnnotationClient(tk.Tk):
             return
         open_path_in_file_manager(str(target))
 
+    def open_step_result_dir(self, key: str) -> None:
+        if key not in ("field_boundary", "train_area", "markers"):
+            raise ValueError(f"没有对应的结果目录：{key}")
+        saved_path = self._saved_preview_paths.get(key)
+        json_path = self._step_save_path(key)
+        target = saved_path.parent if saved_path else json_path.parent
+        if not target.exists():
+            messagebox.showinfo("打开结果目录", "结果目录尚不存在，请先生成并保存本步预览图。")
+            return
+        open_path_in_file_manager(str(target))
+
     def save_and_run_measurement(self) -> None:
-        if self._measurement_running:
-            messagebox.showwarning("运行测量", "测量正在运行，请等待当前任务完成。")
+        if not self._confirm_measurement_retry():
             return
         video_text = self.video_path_var.get().strip()
         if not video_text:
@@ -2943,10 +3076,25 @@ class AnnotationClient(tk.Tk):
         log_text.insert(tk.END, "开始运行测量流程...\n\n")
         log_text.configure(state="disabled")
         self.status.set("测量运行中…")
+        self._measurement_run_id += 1
+        run_id = self._measurement_run_id
+        cancel_event = threading.Event()
         self._measurement_running = True
+        self._measurement_process = None
+        self._measurement_result = None
+        self._measurement_cancel = cancel_event
+        self._measurement_log_window = log_window
+        self._measurement_log_text = log_text
         worker = threading.Thread(target=self._run_measurement_worker,
-                                  args=(log_window, log_text), daemon=True)
-        worker.start()
+                                  args=(run_id, cancel_event), daemon=True)
+        self._measurement_worker = worker
+        try:
+            worker.start()
+        except Exception as exc:
+            self._measurement_result = (run_id, f"测量启动失败：{exc}\n", "测量启动失败")
+            self._finish_measurement_if_done(run_id)
+            return
+        self.after(200, lambda: self._poll_measurement(run_id))
 
     def _open_measurement_log_window(self):
         window = tk.Toplevel(self)
@@ -2964,42 +3112,132 @@ class AnnotationClient(tk.Tk):
         log_text.see(tk.END)
         log_text.configure(state="disabled")
 
-    def _run_measurement_worker(self, log_window, log_text) -> None:
+    def _measurement_task_active(self) -> bool:
+        """Check the worker and child process, not a possibly stale UI flag."""
+        worker = self._measurement_worker
+        process = self._measurement_process
+        return bool((worker is not None and worker.is_alive())
+                    or (process is not None and process.poll() is None))
+
+    def _finish_measurement_if_done(self, run_id: int) -> bool:
+        """Reconcile finished work on the Tk thread, including abnormal exits."""
+        if run_id != self._measurement_run_id or self._measurement_task_active():
+            return False
+        result = self._measurement_result
+        if result is None or result[0] != run_id:
+            output, status = "测量任务已结束，但未返回结果；请重新测量。\n", "测量异常结束"
+        else:
+            _, output, status = result
+        self._measurement_running = False
+        self._measurement_worker = None
+        self._measurement_process = None
+        self._measurement_cancel = None
+        self._measurement_result = None
+        log_window = self._measurement_log_window
+        log_text = self._measurement_log_text
+        self._measurement_log_window = None
+        self._measurement_log_text = None
+        if log_window is not None and log_window.winfo_exists():
+            self._append_measurement_log(log_text, output)
+        self.status.set(status)
+        self._refresh_step_list()
+        self._refresh_finish_summary()
+        if self._measurement_restart_pending:
+            self._measurement_restart_pending = False
+            self.after_idle(self.save_and_run_measurement)
+        return True
+
+    def _poll_measurement(self, run_id: int) -> None:
+        if run_id != self._measurement_run_id:
+            return
+        if not self._finish_measurement_if_done(run_id):
+            self.after(200, lambda: self._poll_measurement(run_id))
+
+    def _force_stop_measurement(self, run_id: int) -> None:
+        if run_id != self._measurement_run_id or not self._measurement_restart_pending:
+            return
+        process = self._measurement_process
+        if process is not None and process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    def _confirm_measurement_retry(self) -> bool:
+        if self._measurement_restart_pending:
+            messagebox.showinfo("重新测量", "正在结束上一次测量，结束后会自动重新测量。")
+            return False
+        active = self._measurement_task_active()
+        if not active and not self._measurement_running:
+            return True
+        if not active:
+            self._finish_measurement_if_done(self._measurement_run_id)
+            return messagebox.askyesno(
+                "重新测量", "上一次测量已经结束，但界面状态未及时更新。是否重新测量？")
+        if not messagebox.askyesno(
+            "重新测量", "当前测量仍在运行。是否结束当前任务并重新测量？\n"
+            "当前任务尚未完成的结果可能无法保留。"):
+            return False
+        # The child may finish while the confirmation dialog is open.
+        # In that case there is nothing to cancel, so start the new run now.
+        if not self._measurement_task_active():
+            if self._measurement_running:
+                self._finish_measurement_if_done(self._measurement_run_id)
+            return True
+        self._measurement_restart_pending = True
+        cancel_event = self._measurement_cancel
+        if cancel_event is not None:
+            cancel_event.set()
+        process = self._measurement_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        self.status.set("正在结束当前测量，随后重新测量…")
+        run_id = self._measurement_run_id
+        self.after(5000, lambda: self._force_stop_measurement(run_id))
+        return False
+
+    def _run_measurement_worker(self, run_id: int,
+                                cancel_event: threading.Event) -> None:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         try:
-            result = subprocess.run(
-                [sys.executable, "measure_marker_position.py"],
-                cwd=str(self.project_dir),
-                input="y\n",
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=env,
-            )
-            output = result.stdout
-            if result.stderr:
-                output += "\n[错误输出]\n" + result.stderr
-            if result.returncode == 0:
-                output += f"\n测量完成。结果目录：{self._manual_dir()}\n"
-                status = "测量完成"
+            if cancel_event.is_set():
+                output, status = "测量已取消，准备重新测量。\n", "测量已取消"
             else:
-                output += f"\n测量失败，退出码：{result.returncode}\n"
-                status = "测量失败"
+                process = subprocess.Popen(
+                    [sys.executable, "measure_marker_position.py"],
+                    cwd=str(self.project_dir),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                )
+                self._measurement_process = process
+                if cancel_event.is_set() and process.poll() is None:
+                    process.terminate()
+                stdout, stderr = process.communicate(input="y\n")
+                output = stdout or ""
+                if stderr:
+                    output += "\n[错误输出]\n" + stderr
+                if cancel_event.is_set():
+                    output += "\n当前测量已停止，准备重新测量。\n"
+                    status = "测量已取消"
+                elif process.returncode == 0:
+                    output += f"\n测量完成。结果目录：{self._manual_dir()}\n"
+                    status = "测量完成"
+                else:
+                    output += f"\n测量失败，退出码：{process.returncode}\n"
+                    status = "测量失败"
         except Exception as exc:
             output = f"测量启动失败：{exc}\n"
             status = "测量启动失败"
-
-        def update_ui() -> None:
-            self._measurement_running = False
-            if log_window.winfo_exists():
-                self._append_measurement_log(log_text, output)
-            self.status.set(status)
-            self._refresh_step_list()
-            self._refresh_finish_summary()
-
-        self.after(0, update_ui)
+        self._measurement_result = (run_id, output, status)
 
 
 def main() -> None:

@@ -679,6 +679,50 @@ class HalfPuGongYingU11Configuration(HalfEliteU12Configuration):
     """蒲公英 U11 半场配置，与精英队 U12 共用场地参数。"""
 
 
+class _RightHalfConfigurationMixin:
+    """Keep the left-half geometry but rotate its field coordinates by 180°.
+
+    The vertex order, edge indices and labels stay unchanged so downstream
+    calibration and measurement code can use the usual configuration API.
+    """
+
+    is_right_half = True
+
+    @property
+    def vertices(self) -> List[Tuple[int, int]]:
+        return [
+            (self.length - x, self.width - y)
+            for x, y in super().vertices
+        ]
+
+
+@dataclass
+class RightHalfPitchConfiguration(_RightHalfConfigurationMixin, HalfPitchConfiguration):
+    """标准球场右半场；由标准左半场旋转 180° 得到。"""
+
+
+@dataclass
+class RightHalfGaoWuConfiguration(_RightHalfConfigurationMixin, HalfGaoWuConfiguration):
+    """高屋小学右半场；沿用左半场的场地尺寸。"""
+
+
+@dataclass
+class RightHalfEliteU12Configuration(_RightHalfConfigurationMixin, HalfEliteU12Configuration):
+    """精英队 U12 右半场。"""
+
+
+@dataclass
+class RightHalfEliteU15Configuration(_RightHalfConfigurationMixin, HalfEliteU15Configuration):
+    """精英队 U15 右半场。"""
+
+
+@dataclass
+class RightHalfPuGongYingU11Configuration(
+    _RightHalfConfigurationMixin, HalfPuGongYingU11Configuration
+):
+    """蒲公英 U11 右半场。"""
+
+
 @dataclass
 class HalfWuChuanConfiguration:
     """吴川半场配置 (33m × 44m)"""

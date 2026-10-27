@@ -95,6 +95,7 @@ class OptionalMarkersWizardTests(unittest.TestCase):
                     pitch_config=object(), image_h=720, image_w=1280,
                     keypoints=[], source_path=None, keypoint_source_name="",
                     boundary_source_name="", marker_groups=groups,
+                    _confirm_measurement_retry=lambda: True,
                     save_all_default=lambda: (_ for _ in ()).throw(_ReachedSave()),
                 )
                 with self.assertRaises(_ReachedSave):

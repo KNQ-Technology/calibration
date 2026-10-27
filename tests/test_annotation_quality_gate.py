@@ -6,6 +6,7 @@ source AST.  The worker is recorded but never started in these tests.
 """
 
 import ast
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -67,6 +68,7 @@ class _App:
         self.media_kind = "video"
         self.video_path_var = SimpleNamespace(get=lambda: str(self.source_path))
         self._measurement_running = False
+        self._measurement_run_id = 0
         self.camera_name = "camera1"
         self.status = _Status()
         self.log_text = _LogText()
@@ -102,6 +104,12 @@ class _App:
     def _run_measurement_worker(self, *_args):
         raise AssertionError("A headless flow test must not run the measurement worker")
 
+    def _confirm_measurement_retry(self):
+        return True
+
+    def after(self, delay, _callback):
+        self.events.append(("poll_scheduled", delay))
+
 
 def _exercise(*, issues=(), confirm=True, boundary_mode=False,
               keypoints_complete=True, missing_step=None):
@@ -135,7 +143,7 @@ def _exercise(*, issues=(), confirm=True, boundary_mode=False,
         ),
         "inspect_calibration_quality": inspect_quality,
         "tk": SimpleNamespace(END="end"),
-        "threading": SimpleNamespace(Thread=FakeThread),
+        "threading": SimpleNamespace(Thread=FakeThread, Event=threading.Event),
     }
     method = _load_save_and_run_measurement(namespace)
     method(app)
